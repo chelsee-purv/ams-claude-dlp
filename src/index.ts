@@ -147,16 +147,34 @@ function luhnCheck(num: string): boolean {
   return sum % 10 === 0;
 }
 
-/** Scan text against all DLP patterns. Returns array of violations. */
-function scanForViolations(text: string): Array<{ pattern: string; match: string }> {
-  const violations: Array<{ pattern: string; match: string }> = [];
+interface Violation {
+  pattern: string;
+  match: string;
+}
+
+/**
+ * Scan text against all DLP patterns. Returns array of violations.
+ *
+ * Uses String.prototype.matchAll() which creates a fresh iterator per call,
+ * so the module-level regex objects are never mutated. This is required
+ * because a Worker isolate handles concurrent requests and the SSE
+ * transform runs asynchronously -- sharing lastIndex across calls would
+ * cause missed or duplicated matches.
+ *
+ * @param text         The text to scan.
+ * @param minEndIndex  Only report matches that END after this index. Used by
+ *                     the incremental SSE scanner: the overlap window re-covers
+ *                     already-scanned text, and this prevents re-reporting
+ *                     matches that were fully contained in that region.
+ */
+function scanForViolations(text: string, minEndIndex = 0): Violation[] {
+  const violations: Violation[] = [];
 
   for (const pattern of DLP_PATTERNS) {
-    // Reset regex lastIndex for global patterns
-    pattern.regex.lastIndex = 0;
-    let match: RegExpExecArray | null;
-    while ((match = pattern.regex.exec(text)) !== null) {
+    for (const match of text.matchAll(pattern.regex)) {
       const candidate = match[0];
+      const start = match.index ?? 0;
+      if (start + candidate.length <= minEndIndex) continue;
       if (!pattern.validate || pattern.validate(candidate)) {
         violations.push({
           pattern: pattern.name,
@@ -174,16 +192,24 @@ function scanForViolations(text: string): Array<{ pattern: string; match: string
 
 /**
  * Read and buffer a request body up to a size limit.
- * Returns the body text, or null if the body is too large or not JSON.
+ * Returns the body text, or null if the body is too large, compressed, or not JSON.
+ * Always drains/cancels the provided stream so the tee'd clone does not leak.
  */
 async function bufferRequestBody(request: Request): Promise<string | null> {
   if (!request.body) return null;
   const contentType = request.headers.get("content-type") ?? "";
-  if (!/^application\/json\b/i.test(contentType)) return null;
-  if (request.headers.has("content-encoding")) return null;
+
+  if (!/^application\/json\b/i.test(contentType) || request.headers.has("content-encoding")) {
+    console.warn("Skipping request DLP: unsupported content-type or encoded body", {
+      contentType,
+      encoding: request.headers.get("content-encoding"),
+    });
+    void request.body.cancel().catch(() => {});
+    return null;
+  }
 
   const reader = request.body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
   let size = 0;
   let text = "";
   try {
@@ -211,45 +237,129 @@ async function bufferRequestBody(request: Request): Promise<string | null> {
 // ---------------------------------------------------------------------------
 
 /**
+ * Maximum length of any single DLP pattern match. Used as the overlap window
+ * when scanning incrementally so a match that straddles two content blocks
+ * is still detected without rescanning the whole accumulated text.
+ */
+const MAX_PATTERN_LEN = 64;
+
+/**
  * Parse SSE events from a text/event-stream response, accumulate text content,
  * and scan for DLP violations at block boundaries.
  *
  * Returns a TransformStream that:
  *  - Passes all SSE bytes through to the client unchanged (real-time streaming)
  *  - Accumulates text_delta content in parallel
- *  - On content_block_stop, scans accumulated text for violations
+ *  - On content_block_stop, scans only the NEW text since the last scan
+ *    (plus a small overlap window) so cost is O(n), not O(n^2)
  *  - On violation, terminates the stream with an SSE error event
  */
 function createDlpInspectionStream(
-  onViolation: (violations: Array<{ pattern: string; match: string }>, accumulatedText: string) => void,
-): {
-  transform: TransformStream<Uint8Array, Uint8Array>;
-  getAccumulatedText: () => string;
-  getViolations: () => Array<{ pattern: string; match: string }>;
-} {
+  onViolation: (violations: Violation[], accumulatedText: string) => void,
+): TransformStream<Uint8Array, Uint8Array> {
   let accumulatedText = "";
-  let allViolations: Array<{ pattern: string; match: string }> = [];
-  let sseBuffer = ""; // Buffer for incomplete SSE lines
+  let scannedUpTo = 0; // Index into accumulatedText that has already been scanned
+  let sseBuffer = ""; // Buffer for incomplete SSE events
   let blocked = false;
 
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
-  const transform = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      if (blocked) return; // Stop forwarding after a block
+  /**
+   * Scan the unscanned tail of accumulatedText. Includes a MAX_PATTERN_LEN
+   * overlap so patterns straddling the previous scan boundary are caught.
+   * Only matches that END past the old boundary are reported, so anything
+   * fully inside the already-scanned region is not double-reported.
+   */
+  function scanNewText(): Violation[] {
+    if (scannedUpTo >= accumulatedText.length) return [];
+    const from = Math.max(0, scannedUpTo - MAX_PATTERN_LEN);
+    const boundaryOffset = scannedUpTo - from; // boundary in window coordinates
+    const violations = scanForViolations(accumulatedText.slice(from), boundaryOffset);
+    scannedUpTo = accumulatedText.length;
+    return violations;
+  }
 
-      // Decode the chunk and pass it through immediately
-      const text = decoder.decode(chunk, { stream: true });
+  function emitBlockAndTerminate(
+    controller: TransformStreamDefaultController<Uint8Array>,
+    violations: Violation[],
+  ) {
+    blocked = true;
+    const errorEvent = [
+      "event: error",
+      `data: ${JSON.stringify({
+        type: "error",
+        error: {
+          type: "dlp_violation",
+          message:
+            "Response blocked: sensitive data detected by DLP policy. " +
+            `${violations.length} violation(s) found: ${violations.map((v) => v.pattern).join(", ")}. ` +
+            "Contact your administrator.",
+        },
+      })}`,
+      "",
+      "",
+    ].join("\n");
+    controller.enqueue(encoder.encode(errorEvent));
+    onViolation(violations, accumulatedText);
+    controller.terminate();
+  }
+
+  function processSSEEvent(
+    eventText: string,
+    controller: TransformStreamDefaultController<Uint8Array>,
+  ) {
+    const dataLines: string[] = [];
+    for (const rawLine of eventText.split("\n")) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (line.startsWith("data: ")) {
+        dataLines.push(line.substring(6));
+      } else if (line === "data:") {
+        dataLines.push("");
+      }
+    }
+    if (dataLines.length === 0) return;
+
+    let data: any;
+    try {
+      data = JSON.parse(dataLines.join("\n"));
+    } catch {
+      return; // Not JSON (e.g. ping or comment) -- skip
+    }
+
+    // Accumulate text from content_block_delta events
+    if (data.type === "content_block_delta" && data.delta) {
+      let piece: string | undefined;
+      if (data.delta.type === "text_delta") piece = data.delta.text;
+      else if (data.delta.type === "input_json_delta") piece = data.delta.partial_json;
+      if (piece && accumulatedText.length < RESPONSE_TEXT_LIMIT) {
+        accumulatedText += piece;
+      }
+    }
+
+    // At content block boundaries, scan the new text since the last scan
+    if (data.type === "content_block_stop") {
+      const violations = scanNewText();
+      if (violations.length > 0) {
+        emitBlockAndTerminate(controller, violations);
+      }
+    }
+  }
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      if (blocked) return;
+
+      // Pass the chunk through to the client immediately
       controller.enqueue(chunk);
 
-      // Also accumulate for DLP scanning
-      sseBuffer += text;
+      // Accumulate for parsing. Normalize CRLF to LF so event splitting works
+      // regardless of the upstream's line ending convention.
+      sseBuffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
 
-      // Process complete SSE events (double newline separated)
-      const events = sseBuffer.split(/\n\n/);
-      // Last element might be incomplete -- keep it in the buffer
-      sseBuffer = events.pop() ?? "";
+      // SSE events are separated by a blank line
+      const events = sseBuffer.split("\n\n");
+      sseBuffer = events.pop() ?? ""; // keep the trailing partial event
 
       for (const event of events) {
         processSSEEvent(event, controller);
@@ -258,104 +368,24 @@ function createDlpInspectionStream(
     },
 
     flush(controller) {
-      // Process any remaining buffer
-      if (sseBuffer.trim() && !blocked) {
+      if (blocked) return;
+
+      // Process any trailing event that didn't get a terminating blank line
+      sseBuffer += decoder.decode(); // flush decoder
+      if (sseBuffer.trim()) {
         processSSEEvent(sseBuffer, controller);
+        if (blocked) return;
       }
 
-      // Final scan of all accumulated text
-      if (!blocked && accumulatedText.length > 0) {
-        const violations = scanForViolations(accumulatedText);
-        if (violations.length > 0) {
-          allViolations.push(...violations);
-          onViolation(violations, accumulatedText);
-          // At flush, the stream is ending anyway -- log but don't inject
-          // (the response is already delivered)
-        }
+      // Catch anything that arrived after the last content_block_stop
+      const violations = scanNewText();
+      if (violations.length > 0) {
+        // Stream is ending anyway; content already delivered. Log, but still
+        // append an error event so the client knows the response was flagged.
+        emitBlockAndTerminate(controller, violations);
       }
     },
   });
-
-  function processSSEEvent(
-    eventText: string,
-    controller: TransformableStreamDefaultController<Uint8Array>,
-  ) {
-    // Parse SSE event: extract event type and data
-    let eventType = "";
-    let dataLines: string[] = [];
-
-    for (const line of eventText.split("\n")) {
-      if (line.startsWith("event: ")) {
-        eventType = line.substring(7).trim();
-      } else if (line.startsWith("data: ")) {
-        dataLines.push(line.substring(6));
-      } else if (line === "data:") {
-        dataLines.push("");
-      }
-    }
-
-    if (dataLines.length === 0) return;
-
-    const dataStr = dataLines.join("\n");
-    let data: any;
-    try {
-      data = JSON.parse(dataStr);
-    } catch {
-      return; // Not JSON, skip (e.g., ping)
-    }
-
-    // Extract text from content_block_delta events
-    if (data.type === "content_block_delta" && data.delta) {
-      if (data.delta.type === "text_delta" && data.delta.text) {
-        if (accumulatedText.length < RESPONSE_TEXT_LIMIT) {
-          accumulatedText += data.delta.text;
-        }
-      }
-      // Also capture input_json_delta for tool use content
-      if (data.delta.type === "input_json_delta" && data.delta.partial_json) {
-        if (accumulatedText.length < RESPONSE_TEXT_LIMIT) {
-          accumulatedText += data.delta.partial_json;
-        }
-      }
-    }
-
-    // At content block boundaries, run a scan on accumulated text so far
-    // This gives us early detection without waiting for the full response
-    if (data.type === "content_block_stop") {
-      const violations = scanForViolations(accumulatedText);
-      if (violations.length > 0) {
-        allViolations.push(...violations);
-        blocked = true;
-
-        // Inject an SSE error event to terminate the client's stream
-        const errorEvent = [
-          "event: error",
-          `data: ${JSON.stringify({
-            type: "error",
-            error: {
-              type: "dlp_violation",
-              message: "Response blocked: sensitive data detected by DLP policy. " +
-                `${violations.length} violation(s) found: ${violations.map((v) => v.pattern).join(", ")}. ` +
-                "Contact your administrator.",
-            },
-          })}`,
-          "",
-          "",
-        ].join("\n");
-        controller.enqueue(encoder.encode(errorEvent));
-
-        onViolation(violations, accumulatedText);
-        controller.terminate();
-        return;
-      }
-    }
-  }
-
-  return {
-    transform,
-    getAccumulatedText: () => accumulatedText,
-    getViolations: () => allViolations,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +491,17 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
     const contentType = response.headers.get("content-type") ?? "";
     const isSSE = contentType.includes("text/event-stream");
 
+    // If the upstream body is compressed we cannot parse it as text. Pass it
+    // through untouched rather than risk corrupting the stream. Anthropic
+    // does not compress SSE in practice, but guard against it anyway.
+    if (response.headers.has("content-encoding")) {
+      console.warn("Skipping response DLP: upstream body is content-encoded", {
+        encoding: response.headers.get("content-encoding"),
+        contentType,
+      });
+      return response;
+    }
+
     if (!isSSE || !response.body) {
       // Non-streaming response -- buffer and scan the JSON body
       if (/^application\/json\b/i.test(contentType) && response.body) {
@@ -472,25 +513,23 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
     // -----------------------------------------------------------------------
     // STEP 3: SSE stream inspection
     // -----------------------------------------------------------------------
-    let violationCallback: Array<{ pattern: string; match: string }> = [];
+    const transform = createDlpInspectionStream((violations, accumulatedText) => {
+      // Log asynchronously -- don't block the stream
+      this.ctx.waitUntil(
+        this.logViolation(context, "response-stream", violations, request.url, accumulatedText),
+      );
+    });
 
-    const { transform, getViolations } = createDlpInspectionStream(
-      (violations, accumulatedText) => {
-        violationCallback = violations;
-        // Log asynchronously -- don't block the stream
-        this.ctx.waitUntil(
-          this.logViolation(context, "response-stream", violations, request.url, accumulatedText),
-        );
-      },
-    );
+    // We may inject an error event and truncate the stream, so any upstream
+    // Content-Length would be wrong. Strip it and let the runtime use chunked
+    // transfer.
+    const headers = new Headers(response.headers);
+    headers.delete("content-length");
 
-    // Pipe the response through our inspection transform
-    const inspectedBody = response.body.pipeThrough(transform);
-
-    return new Response(inspectedBody, {
+    return new Response(response.body.pipeThrough(transform), {
       status: response.status,
       statusText: response.statusText,
-      headers: response.headers,
+      headers,
     });
   }
 
@@ -578,7 +617,7 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
   private async logViolation(
     context: GatewayMiddlewareContext,
     direction: string,
-    violations: Array<{ pattern: string; match: string }>,
+    violations: Violation[],
     url: string,
     contentSample?: string,
   ): Promise<void> {

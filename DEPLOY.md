@@ -29,7 +29,18 @@
 
 ### The Problem
 
-Standard Gateway DLP inspects HTTP request and response bodies as complete objects. Claude Desktop and Claude Code use the Anthropic Messages API (`api.anthropic.com/v1/messages`) with `"stream": true`, which returns responses as **Server-Sent Events (SSE)**. Each SSE event contains a small text fragment (`text_delta`). Gateway DLP scans these fragments individually and cannot match patterns (SSNs, credit card numbers, etc.) that span across multiple SSE chunks.
+Claude Desktop and Claude Code use the Anthropic Messages API (`api.anthropic.com/v1/messages`) with `"stream": true`, which returns **responses** as **Server-Sent Events (SSE)**. Each SSE event contains a small text fragment (`text_delta`). A pattern such as an SSN or credit card number can be split across several events.
+
+The **request** body (the user's prompt) is ordinary JSON and is fully visible to standard Gateway DLP. The streaming concern applies only to the **response** direction -- content Claude generates and returns to the user.
+
+> **Verify the failure mode before deploying.** The original symptom reported for AMS was "Gateway is decrypting the traffic but the DLP policy isn't matching." That symptom is consistent with several causes, and SSE streaming is only one of them. Before attributing the issue to streaming, rule out the following, in order:
+>
+> 1. A **Do Not Inspect** policy matching Anthropic/Claude (Phase 1, Step 3.2) -- this is the most common cause and silently disables all DLP for the traffic
+> 2. The DLP policy using a **Host/Domain selector that matches `claude.ai` but not `api.anthropic.com`** -- Claude Desktop and Claude Code do not use `claude.ai`
+> 3. The DLP profile's **match count or confidence threshold** rejecting the test data (verify with [Test scan](https://developers.cloudflare.com/cloudflare-one/data-loss-prevention/test-scan/))
+> 4. Request-body DLP actually working but the test only exercised the response direction
+>
+> Only if request-side DLP is confirmed working and the residual gap is specifically Claude's *streamed response* text does this Worker add value.
 
 ### The Solution
 
@@ -39,19 +50,38 @@ A **Gateway Forward Worker** (Programmable Gateway) intercepts Claude API traffi
 - **Response side:** Streams SSE events to the client in real time while accumulating `text_delta` content in parallel. At each `content_block_stop` boundary, it scans the accumulated text for DLP violations
 - **On violation:** Blocks the request (request-side) or terminates the stream with an error event (response-side) and logs the violation to R2
 
-### Important: DLP Engine Scope
+### Read This First: Try Native Cloudflare DLP Before Deploying the Worker
+
+Before deploying this Worker, confirm whether Cloudflare's **native** Claude support already meets AMS's requirements. Two built-in capabilities were not fully evaluated during the original troubleshooting and may resolve the issue without custom code:
+
+**1. Application Granular Controls for Claude.** Cloudflare Gateway natively recognizes Claude as a supported AI application (alongside ChatGPT, Gemini, and Perplexity). This means:
+
+- You can build an HTTP policy with **Application** *is* **Claude** and apply DLP profiles to it directly
+- Gateway understands Claude's API operations (prompt submission, etc.) and can target the specific operations that carry scannable prompt content
+- **AI prompt topic detection entries** (Content: PII, Content: Credentials and Secrets, Content: Source Code, Intent: Jailbreak, etc.) are available as predefined DLP detection entries and work with Claude
+- All of this is dashboard-managed and uses the real Cloudflare DLP engine
+
+See [Application Granular Controls](https://developers.cloudflare.com/cloudflare-one/traffic-controls/http-policies/granular-controls/) and [AI prompt topics](https://developers.cloudflare.com/cloudflare-one/data-loss-prevention/detection-entries/configure-detection-entries/#ai-prompt-topics).
+
+**Recommended first step:** Create an HTTP policy with `Application is Claude` + `DLP Profile in [your profile]` -> Block, and test it against Claude Desktop and Claude Code. Confirm in Gateway logs whether the policy matches the request body (the user's prompt). Request-side DLP is the primary control for preventing data exfiltration to an AI service; if native Gateway DLP catches sensitive data in prompts, the streaming-response gap may be an acceptable residual risk.
+
+**2. Custom Validation Workers for DLP.** Cloudflare DLP can invoke a Worker (`DlpValidationEntrypoint`) when a custom pattern entry matches, to adjust confidence or veto the match. This is a different integration point than the Forward Worker -- it plugs into the real DLP engine. It does not help with the streaming-reassembly problem, but it is the correct mechanism if AMS needs organization-specific validation logic (for example, checking a matched ID against an internal allowlist). See [Validate DLP matches with Workers](https://developers.cloudflare.com/cloudflare-one/data-loss-prevention/detection-entries/custom-validation-workers/).
+
+### DLP Engine Scope of This Worker
 
 > **This Worker uses its own regex-based pattern matching, not the Cloudflare One DLP engine.**
 >
-> The Forward Worker cannot call or integrate with Cloudflare's built-in DLP profiles, Exact Data Match (EDM) datasets, or custom wordlists configured in the Zero Trust dashboard. The Gateway Forward action does not expose DLP match results to Workers, and there is no public API to submit text to the Cloudflare DLP engine for scanning.
+> The Forward Worker cannot call or integrate with Cloudflare's built-in DLP profiles, Exact Data Match (EDM) datasets, or custom wordlists configured in the Zero Trust dashboard. The Gateway Forward action does not expose DLP match results to Workers, and there is no public API to submit arbitrary text to the Cloudflare DLP engine for scanning.
 >
 > **What this means for AMS:**
-> - DLP patterns for streaming Claude traffic are defined in the Worker's source code (`src/index.ts`), not the dashboard
+> - DLP patterns for streaming Claude **responses** are defined in the Worker's source code (`src/index.ts`), not the dashboard
 > - Changes to patterns require editing code and redeploying the Worker
-> - Predefined detection profiles (PCI, HIPAA, financial identifiers) available in the dashboard do not apply to the Worker's scanning -- equivalent patterns must be implemented as regex in the Worker
-> - Cloudflare's built-in DLP **does** still apply to non-streaming traffic (Claude web chat, and the request body of all Claude API calls before the Worker receives them)
+> - Predefined detection profiles available in the dashboard do not apply to the Worker's scanning -- equivalent patterns must be implemented as regex in the Worker
+> - Cloudflare's built-in DLP **does** still apply to the request body of all Claude API calls (Gateway scans the original request before the Worker receives it) and to non-streaming responses
 >
-> If centralized, dashboard-managed DLP is a hard requirement for streaming traffic, see [Alternative: Buffer-and-Release Mode](#alternative-buffer-and-release-mode) in the Architecture Notes section.
+> **The Worker's unique value is narrow and specific:** scanning Claude's *streamed response text* (what Claude says back) for sensitive data that spans SSE chunk boundaries. If AMS's primary concern is preventing employees from *sending* sensitive data to Claude, native Gateway DLP on the request body is the right tool and this Worker is optional.
+>
+> If dashboard-managed DLP for streaming responses is a hard requirement, see [Alternative: Buffer-and-Release Mode](#alternative-buffer-and-release-mode).
 
 ### Traffic Flow
 
@@ -93,7 +123,7 @@ Claude Code (WSL/Node.js) --/         |                    |
 Before starting, confirm the following are in place:
 
 - [ ] AMS has an active Cloudflare Zero Trust account (any plan with Gateway)
-- [ ] Workers are enabled on the same Cloudflare account
+- [ ] Workers **Paid** plan is active on the same Cloudflare account (the Free plan's 10 ms CPU limit is insufficient for stream parsing)
 - [ ] TLS decryption is turned on in Gateway settings
 - [ ] A Cloudflare root certificate has been generated and activated (Status: **Available and In-Use**)
 - [ ] The Cloudflare One Client is installed on all 9 test machines
@@ -123,7 +153,7 @@ This is the most common cause of "DLP doesn't fire" issues. Check that no existi
    - Host: `api.anthropic.com`, `claude.ai`, or `*.anthropic.com`
 3. If found, either **remove** it or **narrow** it so it doesn't cover `api.anthropic.com`
 
-> **Why this matters:** Do Not Inspect policies take precedence over DLP policies. If Anthropic traffic matches a Do Not Inspect rule, Gateway will not decrypt it, the Forward Worker will never be invoked, and DLP will not function. This was likely the root cause of the original issue.
+> **Why this matters:** Do Not Inspect policies are evaluated before all other HTTP policies regardless of their position in the list. If Anthropic traffic matches a Do Not Inspect rule, Gateway will not decrypt it, the Forward Worker will never be invoked, and DLP will not function. This is a common, silent cause of "DLP isn't matching" and should be ruled out before any other troubleshooting. Note: the original AMS symptom ("Gateway IS decrypting but policy isn't matching") would be inconsistent with a Do Not Inspect match -- if that observation is accurate, look at causes 2-4 in the Architecture Overview instead.
 
 ### 3.3 Download the Cloudflare Root Certificate
 
@@ -325,17 +355,15 @@ Published ams-claude-dlp
 
 ### 6.6 Note the Worker ID
 
-You will need the Worker ID for the Gateway policy:
+You will need the Worker's immutable ID (a 32-character hex string, **not** the Worker name) for the Gateway Forward policy. Retrieve it from the Workers API:
 
 ```bash
-# Option A: from wrangler
-npx wrangler deployments list
-
-# Option B: from the API
-curl -s "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/scripts" \
+curl -s "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/workers" \
   -H "Authorization: Bearer $API_TOKEN" \
-  | jq '.result[] | select(.id == "ams-claude-dlp") | .id'
+  | jq -r '.result[] | select(.name == "ams-claude-dlp") | .id'
 ```
+
+If you prefer the dashboard, the Forward policy editor lists deployed Workers by name and resolves the ID for you.
 
 ### What the Worker Does
 
@@ -376,10 +404,10 @@ curl -s "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/scrip
 ACCOUNT_ID="<ams-account-id>"
 API_TOKEN="<api-token>"
 
-# Get the Worker ID
-WORKER_ID=$(curl -s "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/scripts" \
+# Get the Worker's immutable ID (32-char hex)
+WORKER_ID=$(curl -s "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/workers" \
   -H "Authorization: Bearer $API_TOKEN" \
-  | jq -r '.result[] | select(.id == "ams-claude-dlp") | .tag')
+  | jq -r '.result[] | select(.name == "ams-claude-dlp") | .id')
 
 # Create the Forward policy
 curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/gateway/rules" \
@@ -431,7 +459,7 @@ curl -X POST https://api.anthropic.com/v1/messages \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
   -d '{
-    "model": "claude-sonnet-4-20250514",
+    "model": "claude-sonnet-5-5",
     "max_tokens": 100,
     "messages": [{"role": "user", "content": "My SSN is 123-45-6789, can you help me?"}]
   }'
@@ -458,7 +486,7 @@ curl -X POST https://api.anthropic.com/v1/messages \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
   -d '{
-    "model": "claude-sonnet-4-20250514",
+    "model": "claude-sonnet-5-5",
     "max_tokens": 200,
     "stream": true,
     "messages": [{"role": "user", "content": "Generate a realistic-looking (but fake) credit card number for testing. Format: XXXX-XXXX-XXXX-XXXX with a valid Luhn checksum."}]
@@ -532,16 +560,22 @@ ams-claude-dlp-logs/
 
 ### View Violation Logs
 
+Wrangler does not provide an `r2 object list` command. Use the dashboard or the S3-compatible API to browse the bucket; use Wrangler to fetch a specific object once you know its key.
+
+**Dashboard:** Go to **R2** > **ams-claude-dlp-logs** > **Objects** and browse by the `request/`, `response-stream/`, or `response-json/` prefix.
+
+**Fetch a specific log with Wrangler** (object path is `<bucket>/<key>`):
 ```bash
-# List recent request-side violations
-npx wrangler r2 object list ams-claude-dlp-logs --prefix "request/"
-
-# List recent response-side violations
-npx wrangler r2 object list ams-claude-dlp-logs --prefix "response-stream/"
-
-# Read a specific violation
-npx wrangler r2 object get ams-claude-dlp-logs "request/2026-10-28/<uuid>.json"
+npx wrangler r2 object get "ams-claude-dlp-logs/request/2026-10-28/<uuid>.json" --pipe
 ```
+
+**List objects with the S3 API** (requires an [R2 API token](https://developers.cloudflare.com/r2/api/tokens/)):
+```bash
+aws s3 ls "s3://ams-claude-dlp-logs/request/" --recursive \
+  --endpoint-url "https://$ACCOUNT_ID.r2.cloudflarestorage.com"
+```
+
+For ongoing operational visibility, consider forwarding violation events to a SIEM via a Logpush job or having the Worker POST to a webhook in addition to writing to R2.
 
 ### Violation Log Format
 
@@ -642,7 +676,8 @@ Request-side DLP has no meaningful latency impact. The Worker buffers the JSON r
 
 ### Worker Execution Limits
 
-- Workers have a 30-second CPU time limit (Paid plan) or 10ms (Free plan). Long Claude responses with many content blocks are fine because the Worker uses streaming, not buffering.
+- Wall-clock duration for HTTP-triggered Workers is **unlimited** as long as the client stays connected, so long-running Claude streams are not at risk of timing out.
+- CPU time is 10 ms on the Workers Free plan and 30 seconds by default on Workers Paid (raisable to 5 minutes via `limits.cpu_ms`). Time spent waiting on the upstream stream does not count as CPU time. The Worker's per-chunk parsing and regex scanning is cheap, but **the Workers Free plan's 10 ms CPU limit is not sufficient** for this Worker -- AMS must be on Workers Paid.
 - The Worker accumulates up to 2 MiB of response text. Responses exceeding this are still streamed but no longer scanned.
 
 ### DLP Coverage Summary
@@ -652,10 +687,10 @@ Request-side DLP has no meaningful latency impact. The Worker buffers the JSON r
 | Claude Web (chat) -- request body | Cloudflare DLP | Yes |
 | Claude Web (chat) -- response body | Cloudflare DLP | Yes |
 | Claude Desktop/Code -- request body (JSON) | Cloudflare DLP scans first, then Worker scans | Both (Cloudflare DLP runs before Worker) |
-| Claude Desktop/Code -- response (SSE streaming) | **Worker regex only** | **No -- code changes required** |
+| Claude Desktop/Code -- response (SSE streaming) | Cloudflare DLP on the stream **plus** Worker reassembly scan | Partially -- Worker patterns are code-managed |
 | Claude Desktop/Code -- response (non-streaming) | Cloudflare DLP scans after Worker, plus Worker scans | Both |
 
-Gateway DLP inspects the original request body before the Worker receives it and inspects the final response after the Worker returns it. For SSE streaming responses, the "final response" is still chunked `text/event-stream` data, which is where standard DLP matching fails. The Worker's regex scanning fills this gap.
+Gateway DLP inspects the original request body before the Worker receives it and inspects the final response after the Worker returns it. Gateway's behavior on chunked `text/event-stream` bodies is not publicly documented in detail; whether it reassembles the stream before pattern matching should be **tested empirically** for AMS's account rather than assumed. The Worker guarantees reassembly on the response side regardless of how Gateway handles it.
 
 ### Alternative: Buffer-and-Release Mode
 
@@ -673,7 +708,7 @@ If AMS requires all DLP scanning to use Cloudflare's built-in DLP engine (dashbo
 **Caveats:**
 
 - **No streaming UX.** The user sees nothing until Claude's entire response is generated. For long code generation or detailed explanations, this could mean 10-30+ seconds of blank screen before any text appears. This fundamentally changes the Claude Desktop and Claude Code experience.
-- **Worker execution time limits.** Workers have a 30-second wall-clock limit on the Paid plan. If Claude takes longer than 30 seconds to generate a full response, the Worker will time out and the request will fail. Long responses with extended thinking or tool use are at risk.
+- **Gateway inspection limits are the real constraint, not Workers.** Workers have no wall-clock limit for HTTP requests, so waiting for Claude's full response is fine on the Workers side. However, Gateway's own HTTP inspection has body size and processing limits that are not fully documented; a very large buffered response returned to Gateway for DLP scanning may be truncated or skipped. Test with representative response sizes before relying on this.
 - **Client compatibility.** Claude Desktop and Claude Code request streaming (`"stream": true`) and expect SSE back. Returning a non-streaming JSON response to a client expecting SSE may cause client-side parsing errors. The Worker would need to either: (a) strip `"stream": true` from the request before forwarding (changing what Claude sees), or (b) reconstruct a synthetic SSE stream from the buffered response (adding complexity).
 - **Memory pressure.** Buffering a full response in Worker memory (up to the 128 MB limit) works for most responses but could be an issue for very large outputs.
 - **Double scanning on requests.** Request-side DLP would still work as-is -- Cloudflare DLP scans the original request body before the Worker, and the Worker can also scan it. No conflict here.
