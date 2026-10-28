@@ -1,0 +1,16 @@
+{
+  "name": "ams-claude-dlp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gateway Forward Worker for DLP inspection of Claude Desktop/Code SSE streaming traffic",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "@cloudflare/zt-types": "^2026.10.1",
+    "wrangler": "^4.0.0",
+    "typescript": "^5.7.0",
+    "@cloudflare/workers-types": "^4.20261000.0"
+  }
+}

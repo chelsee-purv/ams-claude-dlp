@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ams-claude-dlp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-28",
+  // Keep this Worker private -- Gateway invokes it via RPC, not HTTP
+  "workers_dev": false,
+  "preview_urls": false,
+  // R2 bucket for logging DLP violations (optional but recommended for POC)
+  "r2_buckets": [
+    {
+      "binding": "DLP_LOGS",
+      "bucket_name": "ams-claude-dlp-logs"
+    }
+  ]
+}
