@@ -43,7 +43,7 @@ A **Gateway Forward Worker** (Programmable Gateway) intercepts Claude API traffi
 
 ```
 Claude Web (browser)     ---\
-Claude Desktop (Electron) ---|---> WARP Client ---> Cloudflare Gateway
+Claude Desktop (Electron) ---|---> Cloudflare One Client ---> Cloudflare Gateway
 Claude Code (WSL/Node.js) --/         |                    |
                                       |              TLS Decryption
                                       |                    |
@@ -66,11 +66,11 @@ Claude Code (WSL/Node.js) --/         |                    |
 
 ### Coverage Matrix
 
-| Surface | API Endpoint | Traffic Format | DLP Method | WARP Interception |
+| Surface | API Endpoint | Traffic Format | DLP Method | Client Interception |
 |---------|-------------|---------------|------------|-------------------|
-| Claude Web (chat) | claude.ai | JSON (non-streaming) | Standard Gateway DLP | Windows WARP client |
-| Claude Desktop | api.anthropic.com | SSE streaming | Forward Worker | Windows WARP client (Electron uses OS cert store) |
-| Claude Code (CLI) | api.anthropic.com | SSE streaming | Forward Worker | Windows WARP client via WSL mirrored networking |
+| Claude Web (chat) | claude.ai | JSON (non-streaming) | Standard Gateway DLP | Cloudflare One Client |
+| Claude Desktop | api.anthropic.com | SSE streaming | Forward Worker | Cloudflare One Client (Electron uses OS cert store) |
+| Claude Code (CLI) | api.anthropic.com | SSE streaming | Forward Worker | Cloudflare One Client (WSL requires mirrored networking) |
 
 ---
 
@@ -82,8 +82,8 @@ Before starting, confirm the following are in place:
 - [ ] Workers are enabled on the same Cloudflare account
 - [ ] TLS decryption is turned on in Gateway settings
 - [ ] A Cloudflare root certificate has been generated and activated (Status: **Available and In-Use**)
-- [ ] The WARP client is installed on all 9 test machines (Windows)
-- [ ] WARP client is enrolled in the AMS Zero Trust organization
+- [ ] The Cloudflare One Client is installed on all 9 test machines
+- [ ] Cloudflare One Client is enrolled in the AMS Zero Trust organization
 - [ ] `wrangler` CLI is installed for Worker deployment (`npm install -g wrangler`)
 - [ ] AMS has confirmed which DLP patterns they need (SSN, credit cards, API keys, etc.)
 
@@ -113,36 +113,32 @@ This is the most common cause of "DLP doesn't fire" issues. Check that no existi
 
 ### 3.3 Download the Cloudflare Root Certificate
 
-You will need the root certificate in `.pem` format for both Windows and WSL installations.
+You will need the root certificate in `.pem` format for the host OS and any WSL distributions.
 
 1. Go to **Zero Trust** > **Traffic policies** > **Traffic settings** > **Certificates**
 2. Select the **In-Use** certificate
 3. Click **More actions** > **Download .pem**
-4. Save as `Cloudflare_CA.pem` somewhere accessible (e.g., `C:\Users\<username>\Downloads\Cloudflare_CA.pem`)
+4. Save as `Cloudflare_CA.pem` somewhere accessible on the host machine
 
-### 3.4 Install the Root Certificate on Windows
+### 3.4 Install the Root Certificate on the Host OS
 
-The WARP client should install this automatically. To verify or install manually:
+The Cloudflare One Client should install this automatically. To verify or install manually, follow the procedure for your operating system:
 
-1. Right-click the `.crt` file > **Open** > **Install Certificate**
-2. Choose **Current User Store**
-3. Select **Browse** > **Trusted Root Certification Authorities**
-4. Click **OK** > **Finish**
+- **Windows:** Right-click the `.crt` file > **Open** > **Install Certificate** > **Current User Store** > **Trusted Root Certification Authorities**
+- **macOS:** `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain Cloudflare_CA.crt`
+- **Linux:** Copy the `.crt` to `/usr/local/share/ca-certificates/` and run `sudo update-ca-certificates`
 
-Verify in PowerShell:
-```powershell
-Get-ChildItem Cert:\CurrentUser\Root | Where-Object { $_.Subject -like "*Cloudflare*" }
-```
+For detailed instructions per OS, see [Install certificate manually](https://developers.cloudflare.com/cloudflare-one/connections/connect-devices/warp/user-side-certificates/manual-deployment/).
 
 ---
 
 ## 4. Phase 2 -- Claude Desktop Configuration
 
-Claude Desktop is an Electron application. Electron uses Chromium's networking stack, which respects the Windows OS certificate store. If the Cloudflare root CA is installed in the Windows Trusted Root Certification Authorities store (Phase 1), Claude Desktop will accept Gateway's re-signed certificates without any additional configuration.
+Claude Desktop is an Electron application. Electron uses Chromium's networking stack, which respects the host OS certificate store. If the Cloudflare root CA is installed in the system's trusted certificate store (Phase 1), Claude Desktop will accept Gateway's re-signed certificates without any additional configuration.
 
 ### 4.1 Verify Traffic Is Being Intercepted
 
-From a WARP-enrolled machine with Claude Desktop installed:
+From a machine enrolled in the Cloudflare One Client with Claude Desktop installed:
 
 1. Open Claude Desktop and send a test message
 2. In the Cloudflare dashboard, go to **Zero Trust** > **Logs** > **Gateway** > **HTTP**
@@ -150,23 +146,23 @@ From a WARP-enrolled machine with Claude Desktop installed:
 4. Confirm you see log entries for the request
 
 If you see entries, TLS decryption is working. If not, check:
-- WARP client is connected and enrolled
+- Cloudflare One Client is connected and enrolled
 - No Split Tunnel exclude rule for `api.anthropic.com`
 - No Do Not Inspect policy (Phase 1, Step 3.2)
 
 ### 4.2 No Additional Claude Desktop Configuration Needed
 
-Unlike mobile apps that use certificate pinning, Claude Desktop does **not** pin certificates. Once the Cloudflare root CA is in the Windows certificate store and WARP is routing traffic, Claude Desktop traffic flows through Gateway normally.
+Unlike mobile apps that use certificate pinning, Claude Desktop does **not** pin certificates. Once the Cloudflare root CA is in the OS certificate store and the Cloudflare One Client is routing traffic, Claude Desktop traffic flows through Gateway normally.
 
 ---
 
 ## 5. Phase 3 -- Claude Code in WSL Ubuntu
 
-Claude Code running in WSL Ubuntu has two additional challenges: getting WSL traffic through WARP, and getting Node.js to trust the Cloudflare certificate.
+Claude Code running in WSL Ubuntu has two additional challenges: getting WSL traffic through the Cloudflare One Client, and getting Node.js to trust the Cloudflare certificate.
 
 ### 5.1 Configure WSL Mirrored Networking
 
-By default, WSL2 uses NAT networking with its own virtual network adapter. Traffic from WSL may bypass the Windows WARP tunnel. **Mirrored networking mode** makes WSL share the Windows host's network stack, ensuring all WSL traffic routes through WARP.
+By default, WSL2 uses NAT networking with its own virtual network adapter. Traffic from WSL may bypass the Cloudflare One Client tunnel on the host. **Mirrored networking mode** makes WSL share the host's network stack, ensuring all WSL traffic routes through the Cloudflare One Client.
 
 **On each of the 9 test machines:**
 
@@ -185,26 +181,26 @@ wsl --shutdown
 
 3. Relaunch your WSL Ubuntu terminal
 
-4. Verify traffic is routing through WARP:
+4. Verify traffic is routing through the Cloudflare One Client:
 
 ```bash
 # Inside WSL -- check that Cloudflare is intercepting
 curl -sI https://www.cloudflare.com 2>&1 | grep -i "server:"
 # Expected: server: cloudflare
 
-# Check that api.anthropic.com resolves through WARP DNS
+# Check that api.anthropic.com resolves through Gateway DNS
 nslookup api.anthropic.com
 # Should resolve (not fail with NXDOMAIN)
 ```
 
 ### 5.2 Install the Cloudflare Root Certificate in WSL
 
-The Windows certificate store is not shared with WSL Ubuntu. You must install the certificate separately inside WSL.
+The host OS certificate store is not shared with WSL Ubuntu. You must install the certificate separately inside WSL.
 
 ```bash
-# 1. Copy the certificate from the Windows filesystem into WSL
-#    (adjust the Windows username as needed)
-sudo cp /mnt/c/Users/<windows-username>/Downloads/Cloudflare_CA.pem \
+# 1. Copy the certificate from the host filesystem into WSL
+#    (adjust the path to where you saved the certificate)
+sudo cp /mnt/c/Users/<username>/Downloads/Cloudflare_CA.pem \
   /usr/local/share/ca-certificates/Cloudflare_CA.crt
 
 # 2. Update the system CA store
@@ -247,7 +243,7 @@ https.get('https://api.anthropic.com/v1/models', (res) => {
 ```
 
 **Common mistakes to avoid:**
-- Setting `NODE_EXTRA_CA_CERTS` on the Windows side (`set NODE_EXTRA_CA_CERTS=...`) -- this does NOT propagate into WSL
+- Setting `NODE_EXTRA_CA_CERTS` on the host OS side (e.g., `set NODE_EXTRA_CA_CERTS=...` in PowerShell) -- this does NOT propagate into WSL
 - Pointing to a directory instead of a file -- the variable must point to a `.pem` or `.crt` **file**
 - Using `REQUESTS_CA_BUNDLE` or `SSL_CERT_FILE` -- these work for Python, not Node.js
 - The file must be readable by the user running Claude Code (`ls -la $NODE_EXTRA_CA_CERTS` should show read permissions)
@@ -408,7 +404,7 @@ Recommended policy order:
 
 ## 8. Phase 6 -- Testing and Validation
 
-Run these tests on each surface with a WARP-enrolled test user.
+Run these tests on each surface with a test user enrolled in the Cloudflare One Client.
 
 ### Test 1: Request-Side DLP -- Sensitive Data in Prompt
 
@@ -463,7 +459,7 @@ data: {"type":"error","error":{"type":"dlp_violation","message":"Response blocke
 
 ### Test 3: Claude Desktop
 
-1. Open Claude Desktop on a WARP-enrolled Windows machine
+1. Open Claude Desktop on a machine enrolled in the Cloudflare One Client
 2. Type a prompt containing a test SSN: `My social security number is 078-05-1120`
 3. **Expected:** Error message about DLP violation (the request never reaches Claude)
 4. Type a normal prompt: `What is the capital of France?`
@@ -471,7 +467,7 @@ data: {"type":"error","error":{"type":"dlp_violation","message":"Response blocke
 
 ### Test 4: Claude Code in WSL Ubuntu
 
-1. Open a WSL Ubuntu terminal on a WARP-enrolled machine
+1. Open a WSL Ubuntu terminal on a machine enrolled in the Cloudflare One Client
 2. Verify the environment:
    ```bash
    echo $NODE_EXTRA_CA_CERTS
@@ -650,8 +646,8 @@ Per Cloudflare documentation:
 
 ### Claude Desktop: "Connection failed" or SSL errors
 
-- Verify the Cloudflare root CA is in the Windows Trusted Root Certification Authorities store
-- Check that WARP is connected and enrolled
+- Verify the Cloudflare root CA is in the host OS trusted certificate store
+- Check that the Cloudflare One Client is connected and enrolled
 - Check for a Do Not Inspect policy blocking decryption
 
 ### Claude Code in WSL: `UNABLE_TO_VERIFY_LEAF_SIGNATURE`
@@ -674,7 +670,7 @@ openssl x509 -in $NODE_EXTRA_CA_CERTS -noout -subject
 ```bash
 # Check WSL networking mode
 cat /proc/sys/net/ipv4/conf/all/forwarding
-# In mirrored mode, check Windows .wslconfig:
+# In mirrored mode, check the host .wslconfig:
 cat /mnt/c/Users/$USER/.wslconfig
 
 # Test connectivity through Gateway
