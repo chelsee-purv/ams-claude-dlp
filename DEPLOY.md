@@ -39,6 +39,20 @@ A **Gateway Forward Worker** (Programmable Gateway) intercepts Claude API traffi
 - **Response side:** Streams SSE events to the client in real time while accumulating `text_delta` content in parallel. At each `content_block_stop` boundary, it scans the accumulated text for DLP violations
 - **On violation:** Blocks the request (request-side) or terminates the stream with an error event (response-side) and logs the violation to R2
 
+### Important: DLP Engine Scope
+
+> **This Worker uses its own regex-based pattern matching, not the Cloudflare One DLP engine.**
+>
+> The Forward Worker cannot call or integrate with Cloudflare's built-in DLP profiles, Exact Data Match (EDM) datasets, or custom wordlists configured in the Zero Trust dashboard. The Gateway Forward action does not expose DLP match results to Workers, and there is no public API to submit text to the Cloudflare DLP engine for scanning.
+>
+> **What this means for AMS:**
+> - DLP patterns for streaming Claude traffic are defined in the Worker's source code (`src/index.ts`), not the dashboard
+> - Changes to patterns require editing code and redeploying the Worker
+> - Predefined detection profiles (PCI, HIPAA, financial identifiers) available in the dashboard do not apply to the Worker's scanning -- equivalent patterns must be implemented as regex in the Worker
+> - Cloudflare's built-in DLP **does** still apply to non-streaming traffic (Claude web chat, and the request body of all Claude API calls before the Worker receives them)
+>
+> If centralized, dashboard-managed DLP is a hard requirement for streaming traffic, see [Alternative: Buffer-and-Release Mode](#alternative-buffer-and-release-mode) in the Architecture Notes section.
+
 ### Traffic Flow
 
 ```
@@ -630,6 +644,46 @@ Request-side DLP has no meaningful latency impact. The Worker buffers the JSON r
 
 - Workers have a 30-second CPU time limit (Paid plan) or 10ms (Free plan). Long Claude responses with many content blocks are fine because the Worker uses streaming, not buffering.
 - The Worker accumulates up to 2 MiB of response text. Responses exceeding this are still streamed but no longer scanned.
+
+### DLP Coverage Summary
+
+| Traffic Type | DLP Engine Used | Managed via Dashboard? |
+|-------------|----------------|----------------------|
+| Claude Web (chat) -- request body | Cloudflare DLP | Yes |
+| Claude Web (chat) -- response body | Cloudflare DLP | Yes |
+| Claude Desktop/Code -- request body (JSON) | Cloudflare DLP scans first, then Worker scans | Both (Cloudflare DLP runs before Worker) |
+| Claude Desktop/Code -- response (SSE streaming) | **Worker regex only** | **No -- code changes required** |
+| Claude Desktop/Code -- response (non-streaming) | Cloudflare DLP scans after Worker, plus Worker scans | Both |
+
+Gateway DLP inspects the original request body before the Worker receives it and inspects the final response after the Worker returns it. For SSE streaming responses, the "final response" is still chunked `text/event-stream` data, which is where standard DLP matching fails. The Worker's regex scanning fills this gap.
+
+### Alternative: Buffer-and-Release Mode
+
+If AMS requires all DLP scanning to use Cloudflare's built-in DLP engine (dashboard-managed profiles, EDM, custom wordlists), the Worker can be restructured to **buffer the entire SSE response, reassemble it into a standard JSON body, and return it as a non-streaming response**. This lets Gateway's native DLP engine scan the complete response text after the Worker.
+
+**How it would work:**
+
+1. Worker receives the streaming SSE response from `api.anthropic.com`
+2. Worker consumes the entire stream, accumulating all `text_delta` events
+3. Worker reconstructs a complete Claude Messages API response object (JSON)
+4. Worker returns the JSON response to Gateway (non-streaming)
+5. Gateway's response-side DLP scans the full JSON body using dashboard-configured profiles
+6. If DLP passes, the response is delivered to the client
+
+**Caveats:**
+
+- **No streaming UX.** The user sees nothing until Claude's entire response is generated. For long code generation or detailed explanations, this could mean 10-30+ seconds of blank screen before any text appears. This fundamentally changes the Claude Desktop and Claude Code experience.
+- **Worker execution time limits.** Workers have a 30-second wall-clock limit on the Paid plan. If Claude takes longer than 30 seconds to generate a full response, the Worker will time out and the request will fail. Long responses with extended thinking or tool use are at risk.
+- **Client compatibility.** Claude Desktop and Claude Code request streaming (`"stream": true`) and expect SSE back. Returning a non-streaming JSON response to a client expecting SSE may cause client-side parsing errors. The Worker would need to either: (a) strip `"stream": true` from the request before forwarding (changing what Claude sees), or (b) reconstruct a synthetic SSE stream from the buffered response (adding complexity).
+- **Memory pressure.** Buffering a full response in Worker memory (up to the 128 MB limit) works for most responses but could be an issue for very large outputs.
+- **Double scanning on requests.** Request-side DLP would still work as-is -- Cloudflare DLP scans the original request body before the Worker, and the Worker can also scan it. No conflict here.
+
+**When to consider this approach:**
+- AMS has complex DLP profiles (EDM datasets, multi-pattern correlation rules) that can't be replicated with regex
+- Compliance requires that all DLP decisions are made by the same engine and appear in the same DLP incident logs
+- The streaming UX tradeoff is acceptable to the team (most likely not for developer tooling)
+
+**Recommendation:** Start with the current streaming approach for the POC. If AMS decides they need unified dashboard DLP for streaming traffic, the buffer-and-release modification can be scoped as a follow-on. The regex patterns in the Worker should be configured to mirror their most critical dashboard profiles so coverage is equivalent even if the engine is different.
 
 ### Forward Action Constraints
 
