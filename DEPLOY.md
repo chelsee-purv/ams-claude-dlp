@@ -1,10 +1,12 @@
 # AMS Zero Trust DLP for Claude Code and Cowork -- Diagnostic and Deployment Guide
 
-**Customer:** American Musical Supply (AMS)
-**Use Case:** 200-seat Zero Trust / DLP POC displacing Proofpoint
-**Scope:** Gateway DLP is working for Claude web and Claude Desktop chat. It is **not** matching for **Claude Code** (CLI in WSL Ubuntu) and **Cowork** (the Claude Code engine embedded in Claude Desktop). This guide isolates the cause and then applies the right fix.
-**Active testers:** 9 users in developer environments
-**Forward Worker source:** https://gitlab.cfdata.org/chelsee/ams-claude-dlp
+| | |
+|---|---|
+| **Customer** | American Musical Supply (AMS) |
+| **Use case** | 200-seat Zero Trust / DLP POC displacing Proofpoint |
+| **Scope** | Gateway DLP is working for Claude web and Claude Desktop chat. It is **not** matching for **Claude Code** (CLI in WSL Ubuntu) and **Cowork** (the Claude Code engine embedded in Claude Desktop). This guide isolates the cause and then applies the right fix. |
+| **Active testers** | 9 users in developer environments |
+| **Forward Worker source** | https://gitlab.cfdata.org/chelsee/ams-claude-dlp |
 
 > **Status: root cause not yet confirmed, but there is a one-line fix to try first.** The Forward Worker in this repository was built on the hypothesis that SSE response streaming defeats Gateway DLP. That hypothesis has **not been verified**, and Anthropic's own documentation points at a different, request-side cause with a documented one-line fix. **Start with Section 2 (five minutes). Only if that does not resolve it, proceed to the full diagnostic in Section 2b.** The Worker is very likely unnecessary.
 

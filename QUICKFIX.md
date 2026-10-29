@@ -1,9 +1,11 @@
 # Claude Code and Cowork -- DLP Quick Fix
 
-**For:** American Musical Supply (AMS) Zero Trust POC
-**Applies to:** Claude Code (WSL Ubuntu) and Cowork
-**Does not apply to:** Claude web or Claude Desktop chat -- those already work
-**Time required:** About 5 minutes per machine
+| | |
+|---|---|
+| **For** | American Musical Supply (AMS) Zero Trust POC |
+| **Applies to** | Claude Code (WSL Ubuntu) and Cowork |
+| **Does not apply to** | Claude web or Claude Desktop chat -- those already work |
+| **Time required** | About 5 minutes per machine |
 
 ---
 
