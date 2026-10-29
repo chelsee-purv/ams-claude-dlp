@@ -1,14 +1,22 @@
 /**
  * AMS Claude DLP – Gateway Forward Worker
  *
- * Intercepts Claude API traffic (api.anthropic.com) and performs custom DLP
- * inspection on both:
- *   1. REQUEST bodies  – user prompts sent to Claude (JSON, non-streaming)
- *   2. RESPONSE bodies – Claude's SSE streaming responses (text/event-stream)
+ * DEPLOY ONLY IF THE DIAGNOSTIC IN DEPLOY.md SECTION 2 CONFIRMS CAUSE C OR D.
+ * If the root cause is policy scope (Cause A) or gzip request bodies (Cause B),
+ * this Worker is unnecessary -- fix the policy or set
+ * CLAUDE_CODE_GZIP_REQUEST_BODIES=0 on clients instead.
  *
- * Standard Gateway DLP sees SSE chunks individually and can't match patterns
- * that span chunk boundaries. This Worker reassembles the full text content
- * from streaming text_delta events and scans the accumulated output.
+ * Intercepts Claude API traffic (api.anthropic.com) and performs supplementary
+ * regex-based DLP inspection (NOT the Cloudflare DLP engine) on:
+ *   1. REQUEST bodies  – parses the Messages API JSON and scans only the
+ *      user-authored text in messages[].content and system, so the prompt is
+ *      inspected regardless of total body size (addresses Cause C)
+ *   2. RESPONSE bodies – reassembles SSE text_delta events and scans the
+ *      accumulated text at content_block_stop boundaries (addresses Cause D,
+ *      which is UNVERIFIED -- see DEPLOY.md Test 5)
+ *
+ * This Worker does NOT decompress gzip request bodies. Clients must have
+ * CLAUDE_CODE_GZIP_REQUEST_BODIES=0 set for request-side inspection to work.
  *
  * Architecture:
  *   - The Worker streams the response to the client in real time (no buffering delay).

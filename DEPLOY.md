@@ -1,124 +1,308 @@
-# AMS Zero Trust DLP for Claude AI -- Complete Deployment Guide
+# AMS Zero Trust DLP for Claude Code and Cowork -- Diagnostic and Deployment Guide
 
 **Customer:** American Musical Supply (AMS)
 **Use Case:** 200-seat Zero Trust / DLP POC displacing Proofpoint
-**Scope:** DLP coverage across Claude chat (web), Claude Desktop, and Claude Code (WSL Ubuntu)
+**Scope:** Gateway DLP is working for Claude web and Claude Desktop chat. It is **not** matching for **Claude Code** (CLI in WSL Ubuntu) and **Cowork** (the Claude Code engine embedded in Claude Desktop). This guide isolates the cause and then applies the right fix.
 **Active testers:** 9 users in developer environments
 **Forward Worker source:** https://gitlab.cfdata.org/chelsee/ams-claude-dlp
+
+> **Status: root cause not yet confirmed.** The Forward Worker in this repository was built on the hypothesis that SSE response streaming defeats Gateway DLP. That hypothesis has **not been verified**, and the evidence gathered since points at a different, request-side cause. **Run the diagnostic in Section 2 before deploying anything.** The Worker may turn out to be unnecessary.
 
 ---
 
 ## Table of Contents
 
-1. [Architecture Overview](#1-architecture-overview)
-2. [Prerequisites](#2-prerequisites)
-3. [Phase 1 -- Gateway Foundation](#3-phase-1----gateway-foundation)
-4. [Phase 2 -- Claude Desktop Configuration](#4-phase-2----claude-desktop-configuration)
-5. [Phase 3 -- Claude Code in WSL Ubuntu](#5-phase-3----claude-code-in-wsl-ubuntu)
-6. [Phase 4 -- Deploy the Forward Worker (SSE DLP)](#6-phase-4----deploy-the-forward-worker-sse-dlp)
-7. [Phase 5 -- Create the Gateway Forward Policy](#7-phase-5----create-the-gateway-forward-policy)
-8. [Phase 6 -- Testing and Validation](#8-phase-6----testing-and-validation)
-9. [Phase 7 -- Violation Logging and Audit](#9-phase-7----violation-logging-and-audit)
-10. [Customizing DLP Patterns](#10-customizing-dlp-patterns)
-11. [Architecture Notes and Limitations](#11-architecture-notes-and-limitations)
-12. [Troubleshooting](#12-troubleshooting)
+1. [What We Know](#1-what-we-know)
+2. [Root Cause Diagnostic -- Run This First](#2-root-cause-diagnostic----run-this-first)
+3. [Prerequisites](#3-prerequisites)
+4. [Phase 1 -- Gateway Foundation](#4-phase-1----gateway-foundation)
+5. [Phase 2 -- Claude Desktop Chat (Reference, Already Working)](#5-phase-2----claude-desktop-chat-reference-already-working)
+6. [Phase 3 -- Claude Code in WSL Ubuntu](#6-phase-3----claude-code-in-wsl-ubuntu)
+7. [Phase 3b -- Cowork](#7-phase-3b----cowork)
+8. [Phase 4 -- Deploy the Forward Worker (Only If Diagnostic Confirms SSE)](#8-phase-4----deploy-the-forward-worker-only-if-diagnostic-confirms-sse)
+9. [Phase 5 -- Create the Gateway Forward Policy](#9-phase-5----create-the-gateway-forward-policy)
+10. [Phase 6 -- Testing and Validation](#10-phase-6----testing-and-validation)
+11. [Phase 7 -- Violation Logging and Audit](#11-phase-7----violation-logging-and-audit)
+12. [Customizing DLP Patterns](#12-customizing-dlp-patterns)
+13. [Architecture Notes and Limitations](#13-architecture-notes-and-limitations)
+14. [Troubleshooting](#14-troubleshooting)
 
 ---
 
-## 1. Architecture Overview
+## 1. What We Know
 
-### The Problem
+### The failure pattern
 
-Claude Desktop and Claude Code use the Anthropic Messages API (`api.anthropic.com/v1/messages`) with `"stream": true`, which returns **responses** as **Server-Sent Events (SSE)**. Each SSE event contains a small text fragment (`text_delta`). A pattern such as an SSN or credit card number can be split across several events.
+| Surface | Engine making the API call | Inference host | Request body | DLP matches? |
+|---|---|---|---|---|
+| Claude web | Browser (Chromium) | `claude.ai` | Plain JSON | **Yes** |
+| Claude Desktop chat tab | Electron (Chromium) | `claude.ai` (unverified -- see Test 1) | Plain JSON | **Yes** |
+| Claude Code (WSL Ubuntu) | **Claude Code / Node.js** | **`api.anthropic.com`** | **gzip-compressed JSON** (default) | **No** |
+| Cowork (in Claude Desktop) | **Claude Code / Node.js** | **`api.anthropic.com`** | **gzip-compressed JSON** (default) | **No** |
 
-The **request** body (the user's prompt) is ordinary JSON and is fully visible to standard Gateway DLP. The streaming concern applies only to the **response** direction -- content Claude generates and returns to the user.
+Cowork is not a separate product in this respect. Anthropic's documentation states "Cowork runs Claude Code on the member's computer" -- it is the same Claude Code engine, so whatever breaks DLP for Claude Code breaks it for Cowork too.
 
-> **Verify the failure mode before deploying.** The original symptom reported for AMS was "Gateway is decrypting the traffic but the DLP policy isn't matching." That symptom is consistent with several causes, and SSE streaming is only one of them. Before attributing the issue to streaming, rule out the following, in order:
->
-> 1. A **Do Not Inspect** policy matching Anthropic/Claude (Phase 1, Step 3.2) -- this is the most common cause and silently disables all DLP for the traffic
-> 2. The DLP policy using a **Host/Domain selector that matches `claude.ai` but not `api.anthropic.com`** -- Claude Desktop and Claude Code do not use `claude.ai`
-> 3. The DLP profile's **match count or confidence threshold** rejecting the test data (verify with [Test scan](https://developers.cloudflare.com/cloudflare-one/data-loss-prevention/test-scan/))
-> 4. Request-body DLP actually working but the test only exercised the response direction
->
-> Only if request-side DLP is confirmed working and the residual gap is specifically Claude's *streamed response* text does this Worker add value.
+### Four candidate causes
 
-### The Solution
+The working and failing surfaces differ in several ways at once. Any one of these could be the cause, and the diagnostic in Section 2 isolates them one at a time:
 
-A **Gateway Forward Worker** (Programmable Gateway) intercepts Claude API traffic after TLS decryption. The Worker:
+| # | Candidate cause | Direction affected | Evidence for it | Fix if confirmed |
+|---|---|---|---|---|
+| **A** | **Policy selector does not cover `api.anthropic.com`.** A policy built as `Application is Claude` may only match Claude's web-app hostnames, not the Platform API host that Claude Code uses. | Request + response | Working surfaces hit `claude.ai`; failing surfaces hit `api.anthropic.com` | Add `Host is api.anthropic.com` to the policy, or add Platform API operations in Granular Controls. **No Worker needed.** |
+| **B** | **Gzip-compressed request bodies.** Claude Code compresses request bodies with gzip by default. Anthropic's own docs say: *"If [a TLS-inspecting] proxy mishandles gzip-compressed request bodies, set `CLAUDE_CODE_GZIP_REQUEST_BODIES=0`."* Browsers do not compress request bodies. | **Request** | Exactly matches the pattern: only the Claude Code engine compresses; only the Claude Code engine fails. Anthropic documents this as a known proxy issue. | Set `CLAUDE_CODE_GZIP_REQUEST_BODIES=0` via managed settings (applies to both Claude Code and Cowork). **No Worker needed.** |
+| **C** | **Request body too large for the DLP scan window.** Claude Code sends full file contents, tool schemas, and conversation history -- bodies of 50 KB to several MB. The user's prompt may sit past whatever portion Gateway scans. | Request | Plausible but unconfirmed. Gateway's body-scan limits are not publicly documented. | Worker's schema-aware extraction (pulls user text from `messages[]` regardless of total body size), or request Gateway limit increase. |
+| **D** | **SSE response streaming.** Response text arrives as many small `text_delta` events; a pattern spanning events might not match. This was the **original hypothesis** and the reason the Worker was built. | **Response only** | Weakened: Claude Code's request-side DLP failing cannot be explained by a response-format issue. Only relevant if response-side DLP is in scope. | Forward Worker's SSE reassembly. |
 
-- **Request side:** Buffers the JSON request body, extracts user messages, and scans for sensitive data before the prompt reaches Anthropic
-- **Response side:** Streams SSE events to the client in real time while accumulating `text_delta` content in parallel. At each `content_block_stop` boundary, it scans the accumulated text for DLP violations
-- **On violation:** Blocks the request (request-side) or terminates the stream with an error event (response-side) and logs the violation to R2
-
-### Read This First: Try Native Cloudflare DLP Before Deploying the Worker
-
-Before deploying this Worker, confirm whether Cloudflare's **native** Claude support already meets AMS's requirements. Two built-in capabilities were not fully evaluated during the original troubleshooting and may resolve the issue without custom code:
-
-**1. Application Granular Controls for Claude.** Cloudflare Gateway natively recognizes Claude as a supported AI application (alongside ChatGPT, Gemini, and Perplexity). This means:
-
-- You can build an HTTP policy with **Application** *is* **Claude** and apply DLP profiles to it directly
-- Gateway understands Claude's API operations (prompt submission, etc.) and can target the specific operations that carry scannable prompt content
-- **AI prompt topic detection entries** (Content: PII, Content: Credentials and Secrets, Content: Source Code, Intent: Jailbreak, etc.) are available as predefined DLP detection entries and work with Claude
-- All of this is dashboard-managed and uses the real Cloudflare DLP engine
-
-See [Application Granular Controls](https://developers.cloudflare.com/cloudflare-one/traffic-controls/http-policies/granular-controls/) and [AI prompt topics](https://developers.cloudflare.com/cloudflare-one/data-loss-prevention/detection-entries/configure-detection-entries/#ai-prompt-topics).
-
-**Recommended first step:** Create an HTTP policy with `Application is Claude` + `DLP Profile in [your profile]` -> Block, and test it against Claude Desktop and Claude Code. Confirm in Gateway logs whether the policy matches the request body (the user's prompt). Request-side DLP is the primary control for preventing data exfiltration to an AI service; if native Gateway DLP catches sensitive data in prompts, the streaming-response gap may be an acceptable residual risk.
-
-**2. Custom Validation Workers for DLP.** Cloudflare DLP can invoke a Worker (`DlpValidationEntrypoint`) when a custom pattern entry matches, to adjust confidence or veto the match. This is a different integration point than the Forward Worker -- it plugs into the real DLP engine. It does not help with the streaming-reassembly problem, but it is the correct mechanism if AMS needs organization-specific validation logic (for example, checking a matched ID against an internal allowlist). See [Validate DLP matches with Workers](https://developers.cloudflare.com/cloudflare-one/data-loss-prevention/detection-entries/custom-validation-workers/).
-
-### DLP Engine Scope of This Worker
-
-> **This Worker uses its own regex-based pattern matching, not the Cloudflare One DLP engine.**
->
-> The Forward Worker cannot call or integrate with Cloudflare's built-in DLP profiles, Exact Data Match (EDM) datasets, or custom wordlists configured in the Zero Trust dashboard. The Gateway Forward action does not expose DLP match results to Workers, and there is no public API to submit arbitrary text to the Cloudflare DLP engine for scanning.
->
-> **What this means for AMS:**
-> - DLP patterns for streaming Claude **responses** are defined in the Worker's source code (`src/index.ts`), not the dashboard
-> - Changes to patterns require editing code and redeploying the Worker
-> - Predefined detection profiles available in the dashboard do not apply to the Worker's scanning -- equivalent patterns must be implemented as regex in the Worker
-> - Cloudflare's built-in DLP **does** still apply to the request body of all Claude API calls (Gateway scans the original request before the Worker receives it) and to non-streaming responses
->
-> **The Worker's unique value is narrow and specific:** scanning Claude's *streamed response text* (what Claude says back) for sensitive data that spans SSE chunk boundaries. If AMS's primary concern is preventing employees from *sending* sensitive data to Claude, native Gateway DLP on the request body is the right tool and this Worker is optional.
->
-> If dashboard-managed DLP for streaming responses is a hard requirement, see [Alternative: Buffer-and-Release Mode](#alternative-buffer-and-release-mode).
-
-### Traffic Flow
-
-```
-Claude Web (browser)     ---\
-Claude Desktop (Electron) ---|---> Cloudflare One Client ---> Cloudflare Gateway
-Claude Code (WSL/Node.js) --/         |                    |
-                                      |              TLS Decryption
-                                      |                    |
-                                      |             HTTP Policies
-                                      |                    |
-                                      |             Forward Policy
-                                      |                    |
-                                      |            DLP Forward Worker
-                                      |              /          \
-                                      |         [CLEAN]      [VIOLATION]
-                                      |            |              |
-                                      |     api.anthropic.com   Block + Log
-                                      |            |
-                                      |      SSE Response
-                                      |            |
-                                      |     Worker scans accumulated text
-                                      |            |
-                                      |      Stream to client
-```
-
-### Coverage Matrix
-
-| Surface | API Endpoint | Traffic Format | DLP Method | Client Interception |
-|---------|-------------|---------------|------------|-------------------|
-| Claude Web (chat) | claude.ai | JSON (non-streaming) | Standard Gateway DLP | Cloudflare One Client |
-| Claude Desktop | api.anthropic.com | SSE streaming | Forward Worker | Cloudflare One Client (Electron uses OS cert store) |
-| Claude Code (CLI) | api.anthropic.com | SSE streaming | Forward Worker | Cloudflare One Client (WSL requires mirrored networking) |
+**Cause B is now the leading hypothesis.** It is the only one that (a) exactly fits the working/failing split, (b) is documented by the vendor as a known interaction with TLS-inspecting proxies, and (c) explains a *request-side* failure, which is what "DLP policy isn't matching on the prompt" describes. Cause D cannot explain a request-side failure at all.
 
 ---
 
-## 2. Prerequisites
+## 2. Root Cause Diagnostic -- Run This First
+
+Work through these tests in order. Each one isolates a single variable. Record the result of each before moving on; the decision table at the end tells you which fix to apply and whether the Worker is needed.
+
+**You will need:**
+- A machine enrolled in the Cloudflare One Client, with the Cloudflare root CA installed (Phase 1)
+- An Anthropic API key (console.anthropic.com; a few dollars of credit is sufficient)
+- `curl` and `gzip` (`curl` on Windows host via PowerShell works; or run from WSL after completing Phase 3 setup)
+- Access to **Zero Trust > Logs > Gateway > HTTP** in the AMS dashboard
+- The existing DLP policy that works for Claude web, left exactly as it is
+
+**Test data:** Use the SSN `078-05-1120` throughout. It is the famous Woolworth wallet-card number, has been invalid since the 1930s, and is a standard DLP test value. Confirm first with **Zero Trust > Data loss prevention > Test scan** that AMS's DLP profile detects it -- if it does not, fix the profile before continuing.
+
+### Test 1 -- Baseline: what does Gateway see from each surface?
+
+**Goal:** Establish exactly what differs between a working request and a failing one, using Gateway's own logs rather than assumptions.
+
+1. From **Claude Desktop chat**, send: `My SSN is 078-05-1120, can you help me?`
+2. From **Claude Code** in WSL (any folder), send the same prompt.
+3. From **Cowork**, send the same prompt.
+4. In **Zero Trust > Logs > Gateway > HTTP**, filter by the test user's email and the last 10 minutes. For each of the three requests, record:
+
+| Field in Gateway log | Desktop chat | Claude Code | Cowork |
+|---|---|---|---|
+| Host | | | |
+| URL path | | | |
+| Request `Content-Type` | | | |
+| Request `Content-Encoding` | | | |
+| Request body size | | | |
+| Response `Content-Type` | | | |
+| Policy matched (name) | | | |
+| DLP profile matched | | | |
+| Action (Allow / Block) | | | |
+
+**Interpretation:**
+- If Claude Code / Cowork requests **do not appear at all** -> traffic is not reaching Gateway. This is a WSL networking or Cloudflare One Client problem, not a DLP problem. Go to Phase 3 (WSL) / Phase 3b (Cowork) and fix routing first.
+- If they appear with **Host = `api.anthropic.com`** and Desktop chat shows **Host = `claude.ai`** -> **Cause A is live.** Continue to Test 2.
+- If Claude Code / Cowork show **Request `Content-Encoding: gzip`** and Desktop chat does not -> **Cause B is live.** Continue to Test 3.
+- Note whether the **Response `Content-Type`** is `text/event-stream` for Desktop chat. If it is, and Desktop chat's DLP matched, **Cause D is ruled out** -- Gateway already handles SSE fine. If Desktop chat does *not* use `text/event-stream`, Cause D stays open until Test 5.
+
+### Test 2 -- Does the DLP policy cover `api.anthropic.com`?
+
+**Goal:** Confirm the policy's traffic selector matches the host Claude Code uses, independent of body encoding.
+
+1. Open the DLP policy that works for Claude web. Note its **Traffic** expression.
+   - If it is `Application is Claude` -> open **Zero Trust > Team & Resources > App Library > Claude** and check whether `api.anthropic.com` is listed under **Hostnames**. If it is not, the policy cannot match Claude Code.
+   - If it is `Host is claude.ai` or `Domain is claude.ai` -> it does not cover `api.anthropic.com`.
+2. From the enrolled host machine (not WSL), send a **plain, uncompressed** request:
+
+```bash
+curl -s -o /dev/null -w "HTTP %{http_code}\n" https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-5-5","max_tokens":50,"messages":[{"role":"user","content":"My SSN is 078-05-1120"}]}'
+```
+
+3. Check the Gateway HTTP log for this request.
+
+**Interpretation:**
+- **DLP matched / Blocked** -> the policy covers `api.anthropic.com` and plain JSON bodies work. Cause A is ruled out. Continue to Test 3.
+- **No DLP match / Allowed** -> **Cause A confirmed.** Fix: add a condition `Host is api.anthropic.com` (OR with the existing condition) to the policy, or in Granular Controls select Claude's **Platform API** operations in addition to the web-app ones. Re-run this test to confirm, then re-run Test 1 against Claude Code. If Claude Code now matches, **you are done -- no Worker is needed.** If Claude Code still fails, continue to Test 3.
+
+### Test 3 -- Isolate gzip request compression
+
+**Goal:** Send the exact same request body compressed and uncompressed. This is the single most important test.
+
+Run both commands back to back from the same enrolled host machine:
+
+```bash
+BODY='{"model":"claude-sonnet-5-5","max_tokens":50,"messages":[{"role":"user","content":"My SSN is 078-05-1120 -- UNCOMPRESSED TEST"}]}'
+
+# 3a: uncompressed (control)
+curl -s -o /dev/null -w "3a uncompressed: HTTP %{http_code}\n" https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d "$BODY"
+
+# 3b: gzip-compressed (what Claude Code sends by default)
+BODY_GZ='{"model":"claude-sonnet-5-5","max_tokens":50,"messages":[{"role":"user","content":"My SSN is 078-05-1120 -- GZIP TEST"}]}'
+echo -n "$BODY_GZ" | gzip -c > /tmp/body.gz
+curl -s -o /dev/null -w "3b gzip: HTTP %{http_code}\n" https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -H "content-encoding: gzip" \
+  --data-binary @/tmp/body.gz
+```
+
+The distinct marker text (`UNCOMPRESSED TEST` / `GZIP TEST`) lets you tell the two log entries apart.
+
+Check both entries in the Gateway HTTP log.
+
+**Interpretation:**
+
+| 3a (plain) | 3b (gzip) | Conclusion |
+|---|---|---|
+| Blocked | Blocked | Gateway handles gzip fine. Cause B ruled out. Continue to Test 4. |
+| **Blocked** | **Allowed** | **Cause B confirmed.** Gateway DLP is not scanning gzip-compressed request bodies. **Fix:** set `CLAUDE_CODE_GZIP_REQUEST_BODIES=0` on all Claude Code / Cowork machines via managed settings (Phase 3 / 3b). Re-run Test 1 against Claude Code to confirm. **No Worker is needed for request-side DLP.** Also open a Cloudflare support case: Gateway DLP should decompress request bodies. |
+| Allowed | Allowed | Neither matched. Cause A was not actually fixed, or the DLP profile / match count / confidence is wrong. Re-check Test 2 and Test scan. |
+
+### Test 4 -- Isolate request body size
+
+**Goal:** Determine whether a large body (as Claude Code sends) pushes the prompt past Gateway's scan window. Only needed if Tests 2 and 3 both passed but Claude Code still fails.
+
+```bash
+# Generate ~300 KB of filler in a system prompt, with the SSN at the END of the user message
+FILLER=$(head -c 300000 /dev/zero | tr '\0' 'A')
+cat > /tmp/large.json <<EOF
+{"model":"claude-sonnet-5-5","max_tokens":50,
+ "system":"You are a helpful assistant. Context follows. ${FILLER}",
+ "messages":[{"role":"user","content":"My SSN is 078-05-1120 -- LARGE BODY TEST"}]}
+EOF
+ls -la /tmp/large.json   # confirm ~300 KB
+
+curl -s -o /dev/null -w "Test 4 large body: HTTP %{http_code}\n" https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  --data-binary @/tmp/large.json
+```
+
+Anthropic may reject this with a 400 (too many tokens). That does not matter -- Gateway scans the request on the way out regardless of the upstream response. Check the Gateway log.
+
+**Interpretation:**
+- **Blocked** -> body size is not an issue. Cause C ruled out.
+- **Allowed** (while the small body in Test 3a was Blocked) -> **Cause C confirmed.** Gateway's request-body DLP has a size limit that Claude Code's large contexts exceed. **Fix options:** (1) open a Cloudflare support case asking for the limit and whether it can be raised; (2) deploy the Forward Worker, whose request-side logic parses the Messages API JSON and extracts only `messages[].content` text, so the user's prompt is scanned regardless of total body size. This is a legitimate reason to use the Worker, but it is a different reason than SSE.
+
+### Test 5 -- Isolate SSE response streaming
+
+**Goal:** Determine whether Gateway DLP can scan sensitive data in Claude's *response* when it is delivered as SSE. Only relevant if AMS needs response-side DLP (data coming *back* from Claude), and only meaningful once request-side tests pass.
+
+Your DLP policy must apply to the **download** body phase for this test. Check the policy does not have `Body Phase is upload` restricting it.
+
+```bash
+PROMPT='Repeat this exact string back to me and nothing else: 078-05-1120'
+
+# 5a: non-streaming response (plain JSON)
+curl -s -o /dev/null -w "5a non-stream: HTTP %{http_code}\n" https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d "{\"model\":\"claude-sonnet-5-5\",\"max_tokens\":50,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}"
+
+# 5b: streaming response (SSE)
+curl -s -o /dev/null -w "5b stream: HTTP %{http_code}\n" https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d "{\"model\":\"claude-sonnet-5-5\",\"max_tokens\":50,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}"
+```
+
+Note: the **request** in both cases contains the SSN too, so request-side DLP will block both before the response is ever generated if request DLP is working. To test response-side in isolation, either temporarily scope the policy to `Body Phase is download`, or use a prompt that does not itself contain the pattern but reliably elicits one (e.g. `Generate one realistic-looking but fake US SSN in the format XXX-XX-XXXX and output only that`). Use the Gateway log's body-phase indicator to confirm which direction matched.
+
+**Interpretation:**
+
+| 5a (JSON response) | 5b (SSE response) | Conclusion |
+|---|---|---|
+| Blocked | Blocked | Gateway scans SSE responses correctly. **Cause D ruled out. The Worker's SSE reassembly is unnecessary.** |
+| **Blocked** | **Allowed** | **Cause D confirmed** for the response direction. The Forward Worker's SSE reassembly is justified -- but only for response-side DLP. Request-side is handled by whatever Test 2-4 found. |
+| Allowed | Allowed | Response-side DLP is not configured, or body phase is restricted to upload. Fix the policy and re-test. |
+
+### Test 6 -- Confirm the fix on real Claude Code and Cowork
+
+After applying whichever fix the tests above indicated:
+
+1. Apply the fix (policy change, `CLAUDE_CODE_GZIP_REQUEST_BODIES=0`, or Worker deployment).
+2. For the gzip fix, confirm it took effect: run `claude --debug` in WSL, send any prompt, then check the Gateway log for that request -- **Request `Content-Encoding` should now be absent.**
+3. Re-run Test 1 from Claude Code and Cowork.
+4. Both should now show **DLP profile matched / Blocked**.
+
+### Decision table
+
+| Diagnostic result | Root cause | Fix | Forward Worker needed? |
+|---|---|---|---|
+| Test 1: Claude Code absent from logs | WSL/Cowork traffic bypassing Gateway | Phase 3 / 3b network + cert setup | No |
+| Test 2: plain curl not blocked | **A** -- policy doesn't cover `api.anthropic.com` | Add Host condition / Platform API operations | No |
+| Test 3: plain blocked, gzip allowed | **B** -- gzip request bodies not scanned | `CLAUDE_CODE_GZIP_REQUEST_BODIES=0` via managed settings | No |
+| Test 4: small blocked, large allowed | **C** -- body exceeds scan window | Support case, or Worker request-side extraction | Yes -- request side only |
+| Test 5: JSON blocked, SSE allowed | **D** -- SSE responses not scanned | Worker response-side reassembly | Yes -- response side only (if response DLP is in scope) |
+| Tests 2-5 all blocked, Claude Code still fails | Unknown -- Claude Code-specific | Enable DLP payload logging, capture Claude Code's actual request, open support case | Hold |
+
+---
+
+## 2b. The Forward Worker (Conditional)
+
+**Deploy only if the diagnostic confirms Cause C or Cause D.** If it confirms A or B, the fix is a policy change or a client setting, and the Worker adds operational complexity for no benefit.
+
+The Worker is a **Gateway Forward Worker** (Programmable Gateway) that intercepts `api.anthropic.com` traffic after TLS decryption. It:
+
+- **Request side (Cause C):** Parses the Messages API JSON, extracts only the user-authored text from `messages[].content` and `system`, and scans that -- so the prompt is inspected regardless of how large the surrounding tool schemas and file context are
+- **Response side (Cause D):** Streams SSE events to the client in real time while accumulating `text_delta` content in parallel, and scans the accumulated text at each `content_block_stop` boundary
+- **On violation:** Blocks the request (request side) or terminates the stream with an error event (response side), and logs the violation to R2
+
+> **Known gap:** the Worker's request-side inspection currently **skips bodies with `Content-Encoding: gzip`** (it does not decompress). If Cause B is confirmed, the fix is `CLAUDE_CODE_GZIP_REQUEST_BODIES=0` on the client, which also makes the Worker's request path work. Do not rely on the Worker as a workaround for gzip.
+
+### Native Cloudflare capabilities to use first
+
+Two built-in Gateway capabilities should be the default tools for this problem. The Worker is a fallback, not a starting point.
+
+**1. Application Granular Controls for Claude.** Gateway natively recognizes Claude as a supported AI application (alongside ChatGPT, Gemini, and Perplexity). You can build an HTTP policy with **Application** *is* **Claude**, choose the operations that carry prompt content, and attach a DLP profile. **AI prompt topic detection entries** (Content: PII, Content: Credentials and Secrets, Content: Source Code, Intent: Jailbreak, etc.) are available as predefined detection entries and work with Claude. All dashboard-managed, all using the real Cloudflare DLP engine. When building this policy, confirm that it covers Claude's **Platform API** (`api.anthropic.com`) operations, not only the web-app operations -- see Test 2. Docs: [Application Granular Controls](https://developers.cloudflare.com/cloudflare-one/traffic-controls/http-policies/granular-controls/), [AI prompt topics](https://developers.cloudflare.com/cloudflare-one/data-loss-prevention/detection-entries/configure-detection-entries/#ai-prompt-topics).
+
+**2. Custom Validation Workers for DLP.** Cloudflare DLP can invoke a Worker (`DlpValidationEntrypoint`) when a custom pattern entry matches, to adjust confidence or veto the match. This plugs into the real DLP engine and is the correct mechanism if AMS needs organization-specific validation logic (e.g. checking a matched ID against an internal allowlist). It is unrelated to streaming or compression. Docs: [Validate DLP matches with Workers](https://developers.cloudflare.com/cloudflare-one/data-loss-prevention/detection-entries/custom-validation-workers/).
+
+### DLP engine scope of the Forward Worker
+
+> **The Forward Worker uses its own regex-based pattern matching, not the Cloudflare One DLP engine.**
+>
+> The Forward action does not expose DLP match results to Workers, and there is no public API to submit arbitrary text to Cloudflare DLP for scanning. Patterns live in `src/index.ts`, not the dashboard; changes require a redeploy; dashboard profiles, EDM datasets, and wordlists do not apply to the Worker's scanning.
+>
+> Cloudflare's built-in DLP **does** still scan the original request body before the Worker receives it, and the final response after the Worker returns it. The Worker supplements that scanning only in the two cases the diagnostic can confirm: oversized request bodies (Cause C) and SSE response reassembly (Cause D).
+>
+> If dashboard-managed DLP for streaming responses is a hard requirement and Cause D is confirmed, see [Alternative: Buffer-and-Release Mode](#alternative-buffer-and-release-mode).
+
+### Traffic flow
+
+```
+Claude Web (browser)           --\
+Claude Desktop chat (Electron) ---|--> claude.ai          ---\
+                                                              |--> Cloudflare One Client --> Gateway
+Claude Code (WSL, Node.js)     --\                            |         |
+Cowork (Claude Code engine)    ---|--> api.anthropic.com  ---/    TLS decryption
+                                   gzip request bodies                  |
+                                   SSE responses               HTTP policies + DLP
+                                                                        |
+                                                              [Forward policy -- only if
+                                                               diagnostic confirms C or D]
+                                                                        |
+                                                                   Forward Worker
+                                                                        |
+                                                                  upstream / block
+```
+
+### Coverage matrix (target state after the correct fix is applied)
+
+| Surface | Host | Request body | Response | Primary DLP control | Worker role |
+|---|---|---|---|---|---|
+| Claude web | `claude.ai` | JSON | (verify in Test 1) | Native Gateway DLP -- **already working** | None |
+| Claude Desktop chat | `claude.ai` (verify) | JSON | (verify in Test 1) | Native Gateway DLP -- **already working** | None |
+| Claude Code (WSL) | `api.anthropic.com` | JSON (gzip off via managed settings) | SSE | Native Gateway DLP, once policy covers host and gzip is disabled | Only if Cause C or D confirmed |
+| Cowork | `api.anthropic.com` | JSON (gzip off via managed settings) | SSE | Native Gateway DLP, once policy covers host and gzip is disabled | Only if Cause C or D confirmed |
+
+---
+
+## 3. Prerequisites
 
 Before starting, confirm the following are in place:
 
@@ -133,17 +317,17 @@ Before starting, confirm the following are in place:
 
 ---
 
-## 3. Phase 1 -- Gateway Foundation
+## 4. Phase 1 -- Gateway Foundation
 
 These steps ensure Gateway is correctly intercepting and decrypting HTTPS traffic.
 
-### 3.1 Verify TLS Decryption Is Enabled
+### 4.1 Verify TLS Decryption Is Enabled
 
 1. In the Cloudflare dashboard, go to **Zero Trust** > **Traffic policies** > **Traffic settings**
 2. Under **Proxy and inspection**, confirm **Inspect HTTPS requests with TLS decryption** is ON
 3. Under **Certificates**, confirm the root certificate shows **Available and In-Use**
 
-### 3.2 Verify No Do Not Inspect Conflict
+### 4.2 Verify No Do Not Inspect Conflict
 
 This is the most common cause of "DLP doesn't fire" issues. Check that no existing policy is bypassing inspection for Claude traffic.
 
@@ -153,9 +337,9 @@ This is the most common cause of "DLP doesn't fire" issues. Check that no existi
    - Host: `api.anthropic.com`, `claude.ai`, or `*.anthropic.com`
 3. If found, either **remove** it or **narrow** it so it doesn't cover `api.anthropic.com`
 
-> **Why this matters:** Do Not Inspect policies are evaluated before all other HTTP policies regardless of their position in the list. If Anthropic traffic matches a Do Not Inspect rule, Gateway will not decrypt it, the Forward Worker will never be invoked, and DLP will not function. This is a common, silent cause of "DLP isn't matching" and should be ruled out before any other troubleshooting. Note: the original AMS symptom ("Gateway IS decrypting but policy isn't matching") would be inconsistent with a Do Not Inspect match -- if that observation is accurate, look at causes 2-4 in the Architecture Overview instead.
+> **Why this matters:** Do Not Inspect policies are evaluated before all other HTTP policies regardless of their position in the list. If Anthropic traffic matches a Do Not Inspect rule, Gateway will not decrypt it, the Forward Worker will never be invoked, and DLP will not function. This is a common, silent cause of "DLP isn't matching" and should be ruled out before any other troubleshooting. Note: the original AMS symptom ("Gateway IS decrypting but policy isn't matching") is inconsistent with a Do Not Inspect match -- and the fact that Claude web and Desktop chat work confirms Anthropic hosts are being decrypted. This step is a sanity check only; the real diagnosis is in Section 2.
 
-### 3.3 Download the Cloudflare Root Certificate
+### 4.3 Download the Cloudflare Root Certificate
 
 You will need the root certificate in `.pem` format for the host OS and any WSL distributions.
 
@@ -164,7 +348,7 @@ You will need the root certificate in `.pem` format for the host OS and any WSL 
 3. Click **More actions** > **Download .pem**
 4. Save as `Cloudflare_CA.pem` somewhere accessible on the host machine
 
-### 3.4 Install the Root Certificate on the Host OS
+### 4.4 Install the Root Certificate on the Host OS
 
 The Cloudflare One Client should install this automatically. To verify or install manually, follow the procedure for your operating system:
 
@@ -176,35 +360,44 @@ For detailed instructions per OS, see [Install certificate manually](https://dev
 
 ---
 
-## 4. Phase 2 -- Claude Desktop Configuration
+## 5. Phase 2 -- Claude Desktop Chat (Reference, Already Working)
 
-Claude Desktop is an Electron application. Electron uses Chromium's networking stack, which respects the host OS certificate store. If the Cloudflare root CA is installed in the system's trusted certificate store (Phase 1), Claude Desktop will accept Gateway's re-signed certificates without any additional configuration.
+AMS reports that DLP already works for the Claude Desktop **chat** tab. This phase exists only as a reference point for the diagnostic. No changes are needed.
 
-### 4.1 Verify Traffic Is Being Intercepted
+Claude Desktop's chat tab is an Electron (Chromium) UI. It uses the host OS certificate store, does not pin certificates, and -- like a browser -- sends plain, uncompressed JSON request bodies. The Code tab and Cowork inside the same app are different: they run the Claude Code engine, which has its own network behavior (Phase 3 and 3b).
 
-From a machine enrolled in the Cloudflare One Client with Claude Desktop installed:
+### 5.1 Capture the reference log entry
 
-1. Open Claude Desktop and send a test message
-2. In the Cloudflare dashboard, go to **Zero Trust** > **Logs** > **Gateway** > **HTTP**
-3. Filter by **Host** = `api.anthropic.com`
-4. Confirm you see log entries for the request
-
-If you see entries, TLS decryption is working. If not, check:
-- Cloudflare One Client is connected and enrolled
-- No Split Tunnel exclude rule for `api.anthropic.com`
-- No Do Not Inspect policy (Phase 1, Step 3.2)
-
-### 4.2 No Additional Claude Desktop Configuration Needed
-
-Unlike mobile apps that use certificate pinning, Claude Desktop does **not** pin certificates. Once the Cloudflare root CA is in the OS certificate store and the Cloudflare One Client is routing traffic, Claude Desktop traffic flows through Gateway normally.
+As part of Test 1 in the diagnostic, record the Gateway HTTP log entry for a Desktop chat request. The fields that matter for comparison are **Host**, **Request Content-Encoding**, **Response Content-Type**, and **DLP profile matched**. This is the known-good baseline the failing surfaces are compared against.
 
 ---
 
-## 5. Phase 3 -- Claude Code in WSL Ubuntu
+## 6. Phase 3 -- Claude Code in WSL Ubuntu
 
-Claude Code running in WSL Ubuntu has two additional challenges: getting WSL traffic through the Cloudflare One Client, and getting Node.js to trust the Cloudflare certificate.
+Claude Code in WSL Ubuntu has three things to get right, in order: (1) traffic has to reach Gateway, (2) Claude Code has to trust Gateway's certificate, and (3) Claude Code's request bodies have to be in a form Gateway DLP can scan.
 
-### 5.1 Configure WSL Mirrored Networking
+### 6.0 Turn off gzip request compression (likely the actual fix)
+
+Claude Code gzip-compresses request bodies to the Claude API by default. Anthropic's enterprise network documentation states:
+
+> *"If such a [TLS-inspection] proxy mishandles gzip-compressed request bodies, set `CLAUDE_CODE_GZIP_REQUEST_BODIES=0` to turn off compression for Claude API, telemetry, and artifact publish requests."*
+
+If Test 3 in the diagnostic confirmed Cause B, this is the fix. Set it in Claude Code's settings rather than the shell so it also reaches Cowork and background agents:
+
+**Per-user (for the POC):** add to `~/.claude/settings.json` inside WSL:
+```json
+{
+  "env": {
+    "CLAUDE_CODE_GZIP_REQUEST_BODIES": "0"
+  }
+}
+```
+
+**Org-wide (for the 200-seat rollout):** deliver the same `env` block via Claude Code [managed settings](https://code.claude.com/docs/en/managed-settings) (`managed-settings.json` or MDM policy). Managed settings apply to Claude Code in the terminal, the Desktop Code tab, and Cowork.
+
+Verify: send a prompt from Claude Code and confirm in the Gateway HTTP log that the request no longer shows `Content-Encoding: gzip`.
+
+### 6.1 Configure WSL Mirrored Networking
 
 By default, WSL2 uses NAT networking with its own virtual network adapter. Traffic from WSL may bypass the Cloudflare One Client tunnel on the host. **Mirrored networking mode** makes WSL share the host's network stack, ensuring all WSL traffic routes through the Cloudflare One Client.
 
@@ -237,9 +430,9 @@ nslookup api.anthropic.com
 # Should resolve (not fail with NXDOMAIN)
 ```
 
-### 5.2 Install the Cloudflare Root Certificate in WSL
+### 6.2 Install the Cloudflare Root Certificate in WSL
 
-The host OS certificate store is not shared with WSL Ubuntu. You must install the certificate separately inside WSL.
+The host OS certificate store is not shared with WSL Ubuntu. You must install the certificate separately inside WSL. Claude Code's native installer reads the **operating system** trust store -- in WSL that means Ubuntu's `/etc/ssl/certs`, not the Windows store -- so once the certificate is in Ubuntu's store, Claude Code trusts it without further configuration.
 
 ```bash
 # 1. Copy the certificate from the host filesystem into WSL
@@ -255,82 +448,136 @@ openssl s_client -connect api.anthropic.com:443 -CApath /etc/ssl/certs 2>/dev/nu
 # Should show a successful TLS connection, not "verify error"
 ```
 
-### 5.3 Configure Node.js to Trust the Cloudflare Certificate
+### 6.3 Certificate trust -- when `NODE_EXTRA_CA_CERTS` is still needed
 
-Claude Code is a Node.js application. Node.js uses its own bundled CA certificates and does **not** read the Ubuntu system certificate store by default. You must explicitly tell Node.js where to find the Cloudflare root CA.
+Per Anthropic's docs, Claude Code's default trust store is `bundled,system`: it trusts both its bundled Mozilla CAs **and** the OS store. With the native installer, step 6.2 is sufficient. You only need `NODE_EXTRA_CA_CERTS` if:
 
-```bash
-# 1. Set the NODE_EXTRA_CA_CERTS environment variable
-export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/Cloudflare_CA.crt
+- Claude Code was installed via **npm** on a Node version older than 22.15 (no OS-store support), or
+- You want an explicit, auditable trust path independent of the system store
 
-# 2. Make it persistent across sessions
-echo 'export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/Cloudflare_CA.crt' >> ~/.bashrc
+If needed, set it in `~/.claude/settings.json` (not just the shell), so it also reaches Cowork and background agents:
 
-# 3. Reload your shell
-source ~/.bashrc
-
-# 4. Verify Node.js can connect through Gateway
-node -e "
-const https = require('https');
-https.get('https://api.anthropic.com/v1/models', (res) => {
-  console.log('Status:', res.statusCode);
-  console.log('TLS OK - Gateway interception working');
-}).on('error', (e) => {
-  console.error('ERROR:', e.message);
-  if (e.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
-    console.error('NODE_EXTRA_CA_CERTS is not set correctly');
+```json
+{
+  "env": {
+    "NODE_EXTRA_CA_CERTS": "/usr/local/share/ca-certificates/Cloudflare_CA.crt",
+    "CLAUDE_CODE_GZIP_REQUEST_BODIES": "0"
   }
-});
-"
-# Expected: Status: 401 (auth required, but TLS succeeded)
-# If you see UNABLE_TO_VERIFY_LEAF_SIGNATURE, the cert path is wrong
+}
 ```
 
-**Common mistakes to avoid:**
-- Setting `NODE_EXTRA_CA_CERTS` on the host OS side (e.g., `set NODE_EXTRA_CA_CERTS=...` in PowerShell) -- this does NOT propagate into WSL
-- Pointing to a directory instead of a file -- the variable must point to a `.pem` or `.crt` **file**
-- Using `REQUESTS_CA_BUNDLE` or `SSL_CERT_FILE` -- these work for Python, not Node.js
-- The file must be readable by the user running Claude Code (`ls -la $NODE_EXTRA_CA_CERTS` should show read permissions)
+**Common mistakes:**
+- Setting the variable only on the host OS side (PowerShell) -- it does not propagate into WSL
+- Pointing to a directory instead of a `.pem`/`.crt` **file**
+- Using `REQUESTS_CA_BUNDLE` or `SSL_CERT_FILE` -- those are for Python, not Node.js
+- Exporting it only in `.bashrc` -- shell exports do not reach Cowork or the background-agent supervisor; use the settings `env` block
 
-### 5.4 Verify Claude Code Works Through Gateway
+### 6.4 Verify the configuration loaded
 
 ```bash
-# Start Claude Code
-claude
+# Start Claude Code with debug logging
+claude --debug
 
-# Inside Claude Code, send a test message
-# Then check Gateway logs in the dashboard:
-# Zero Trust > Logs > Gateway > HTTP > filter Host = api.anthropic.com
+# Send any prompt, then exit and inspect the log
+ls -t ~/.claude/debug/*.txt | head -1 | xargs grep -iE "CA certs|NODE_EXTRA_CA|gzip|Failed to (read|load)"
 ```
+
+Expected lines include `CA certs: Appended extra certificates from NODE_EXTRA_CA_CERTS (...)` if you set it. A `Failed to read` line means the path is wrong.
+
+Then confirm end-to-end in the Gateway HTTP log (**Zero Trust > Logs > Gateway > HTTP**, filter Host = `api.anthropic.com`):
+- The request **appears** (traffic is reaching Gateway)
+- **Request Content-Encoding is absent** (gzip is off)
+- The DLP profile **matches** when the prompt contains the test SSN
 
 ---
 
-## 6. Phase 4 -- Deploy the Forward Worker (SSE DLP)
+## 7. Phase 3b -- Cowork
 
-The Forward Worker performs custom DLP inspection on Claude's SSE streaming responses. Source code is available at:
+Cowork is the Claude Code engine running inside Claude Desktop, with shell commands executed in a local VM. Anthropic's documentation: *"Cowork runs Claude Code on the member's computer, so Claude Code's managed settings apply to Cowork tasks as well as to the terminal."* Whatever fix resolves Claude Code also resolves Cowork -- but it must be delivered through the right channel.
+
+### 7.1 How Cowork reads network settings
+
+For Cowork sessions (and Code tab sessions on third-party providers), Claude Code reads `NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_GZIP_REQUEST_BODIES`, and the proxy variables **only from managed settings and `~/.claude/settings.json`**. It ignores them in repository `.claude/settings.json` files and in shell exports. So:
+
+| Delivery method | Reaches Claude Code terminal? | Reaches Cowork? |
+|---|---|---|
+| Shell `export` in `.bashrc` | Yes | **No** |
+| Repository `.claude/settings.json` | Yes (after trust) | **No** |
+| `~/.claude/settings.json` `env` block | Yes | Yes |
+| Managed settings (`managed-settings.json` / MDM) `env` block | Yes | Yes |
+
+For the POC, `~/.claude/settings.json` on each tester's machine is sufficient. For the 200-seat rollout, use managed settings.
+
+### 7.2 Apply the fix
+
+On the **host OS** (where Claude Desktop runs -- not inside WSL), edit `~/.claude/settings.json` (Windows: `%USERPROFILE%\.claude\settings.json`):
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_GZIP_REQUEST_BODIES": "0"
+  }
+}
+```
+
+Add `NODE_EXTRA_CA_CERTS` to the same block only if the host-OS certificate store does not already contain the Cloudflare root CA (Phase 1, step 4.4). Point it at a host-OS path, e.g. `C:\\ProgramData\\Cloudflare\\Cloudflare_CA.pem`.
+
+Restart Claude Desktop so Cowork picks up the change.
+
+### 7.3 The `requireCoworkFullVmSandbox` caveat
+
+Claude Desktop has a policy key, `requireCoworkFullVmSandbox`. When it is `true`, the **entire** Claude Code process runs inside Cowork's VM -- and per Anthropic's docs, Claude Code then *"doesn't read the computer's managed settings."* In that mode:
+
+- The `env` block fix above does **not** reach Cowork
+- The VM has its own network stack and certificate store (Anthropic-provided image); there is no documented way to inject the Cloudflare root CA into it
+- Gateway would see Cowork's API traffic originate from the VM, and TLS interception would fail unless the VM trusts the Cloudflare CA
+
+**Recommendation for the POC:** leave `requireCoworkFullVmSandbox` unset (default `false`). Confirm in the Claude Desktop policy on the test machines (macOS: `com.anthropic.claudefordesktop` profile; Windows: `HKLM\SOFTWARE\Policies\Claude`) that this key is absent or `false`. If AMS's security policy later requires the full VM sandbox, that is a separate conversation with Anthropic about CA injection into the Cowork VM image.
+
+### 7.4 Cowork's own network egress control (not a Cloudflare control)
+
+Separately from Gateway, Anthropic provides an organization-level setting at **claude.ai > Organization settings > Capabilities > Allow network egress** that controls which hosts Cowork's VM can reach for shell commands. This is an Anthropic-side control and operates independently of Cloudflare. It does not affect the Claude Code engine's API calls to `api.anthropic.com` (those always go out), only the egress of commands Claude runs in the VM. Note it for completeness; it is not part of the DLP fix.
+
+### 7.5 Verify
+
+Send a prompt containing the test SSN from Cowork. In the Gateway HTTP log, confirm the request appears with Host `api.anthropic.com`, no `Content-Encoding: gzip`, and the DLP profile matched.
+
+---
+
+## 8. Phase 4 -- Deploy the Forward Worker (Only If Diagnostic Confirms Cause C or D)
+
+> **Gate:** Do not proceed with this phase unless the Section 2 diagnostic produced one of these results:
+> - **Test 4:** small body blocked, large body allowed (Cause C -- oversized request bodies)
+> - **Test 5:** JSON response blocked, SSE response allowed (Cause D -- SSE responses not scanned)
+>
+> If the diagnostic pointed at Cause A (policy scope) or Cause B (gzip), the fix is a policy edit or a client setting respectively. Skip this phase entirely; the Worker would add a code-managed DLP layer with no benefit.
+
+The Forward Worker performs supplementary DLP inspection on `api.anthropic.com` traffic. Source code:
 
 **https://gitlab.cfdata.org/chelsee/ams-claude-dlp**
 
-### 6.1 Clone the Repository
+Prerequisite: `CLAUDE_CODE_GZIP_REQUEST_BODIES=0` must already be deployed to clients (Phase 3 / 3b). The Worker does not decompress gzip request bodies.
+
+### 8.1 Clone the Repository
 
 ```bash
 git clone git@gitlab.cfdata.org:chelsee/ams-claude-dlp.git
 cd ams-claude-dlp
 ```
 
-### 6.2 Install Dependencies
+### 8.2 Install Dependencies
 
 ```bash
 npm install
 ```
 
-### 6.3 Create the R2 Bucket for Violation Logs
+### 8.3 Create the R2 Bucket for Violation Logs
 
 ```bash
 npx wrangler r2 bucket create ams-claude-dlp-logs
 ```
 
-### 6.4 Authenticate Wrangler
+### 8.4 Authenticate Wrangler
 
 Ensure Wrangler is authenticated to the AMS Cloudflare account:
 
@@ -341,7 +588,7 @@ npx wrangler whoami
 npx wrangler login
 ```
 
-### 6.5 Deploy the Worker
+### 8.5 Deploy the Worker
 
 ```bash
 npx wrangler deploy
@@ -353,7 +600,7 @@ Uploaded ams-claude-dlp
 Published ams-claude-dlp
 ```
 
-### 6.6 Note the Worker ID
+### 8.6 Note the Worker ID
 
 You will need the Worker's immutable ID (a 32-character hex string, **not** the Worker name) for the Gateway Forward policy. Retrieve it from the Workers API:
 
@@ -383,13 +630,13 @@ If you prefer the dashboard, the Forward policy editor lists deployed Workers by
 
 ---
 
-## 7. Phase 5 -- Create the Gateway Forward Policy
+## 9. Phase 5 -- Create the Gateway Forward Policy
 
-### 7.1 Via the Dashboard
+### 9.1 Via the Dashboard
 
 1. Go to **Zero Trust** > **Traffic controls** > **Firewall policies** > **HTTP**
 2. Click **Add a policy**
-3. Set the policy name: `Claude DLP -- SSE Stream Inspection`
+3. Set the policy name: `Claude DLP -- Forward Worker`
 4. Configure traffic conditions:
    - Selector: **Host** | Operator: **is** | Value: `api.anthropic.com`
    - Click **And**
@@ -398,7 +645,7 @@ If you prefer the dashboard, the Forward policy editor lists deployed Workers by
 6. Select Worker: `ams-claude-dlp`
 7. Click **Create policy**
 
-### 7.2 Via the API
+### 9.2 Via the API
 
 ```bash
 ACCOUNT_ID="<ams-account-id>"
@@ -414,7 +661,7 @@ curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/gateway/
   -H "Authorization: Bearer $API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "Claude DLP - SSE Stream Inspection",
+    "name": "Claude DLP - Forward Worker",
     "enabled": true,
     "precedence": 100,
     "action": "forward",
@@ -428,7 +675,7 @@ curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/gateway/
   }'
 ```
 
-### 7.3 Policy Ordering
+### 9.3 Policy Ordering
 
 Ensure this Forward policy does **not** conflict with other HTTP policies:
 
@@ -444,7 +691,7 @@ Recommended policy order:
 
 ---
 
-## 8. Phase 6 -- Testing and Validation
+## 10. Phase 6 -- Testing and Validation
 
 Run these tests on each surface with a test user enrolled in the Cloudflare One Client.
 
@@ -541,7 +788,7 @@ Verify normal development workflows are not impacted:
 
 ---
 
-## 9. Phase 7 -- Violation Logging and Audit
+## 11. Phase 7 -- Violation Logging and Audit
 
 All DLP violations are logged to the R2 bucket `ams-claude-dlp-logs` with the following structure:
 
@@ -609,7 +856,7 @@ For compliance, configure retention on the R2 bucket:
 
 ---
 
-## 10. Customizing DLP Patterns
+## 12. Customizing DLP Patterns
 
 Edit `src/index.ts` in the Worker project and modify the `DLP_PATTERNS` array.
 
@@ -660,7 +907,7 @@ npx wrangler deploy
 
 ---
 
-## 11. Architecture Notes and Limitations
+## 13. Architecture Notes and Limitations
 
 ### Streaming DLP Timing
 
@@ -731,7 +978,7 @@ Per Cloudflare documentation:
 
 ---
 
-## 12. Troubleshooting
+## 14. Troubleshooting
 
 ### Claude Desktop: "Connection failed" or SSL errors
 
