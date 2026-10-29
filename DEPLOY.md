@@ -6,14 +6,15 @@
 **Active testers:** 9 users in developer environments
 **Forward Worker source:** https://gitlab.cfdata.org/chelsee/ams-claude-dlp
 
-> **Status: root cause not yet confirmed.** The Forward Worker in this repository was built on the hypothesis that SSE response streaming defeats Gateway DLP. That hypothesis has **not been verified**, and the evidence gathered since points at a different, request-side cause. **Run the diagnostic in Section 2 before deploying anything.** The Worker may turn out to be unnecessary.
+> **Status: root cause not yet confirmed, but there is a one-line fix to try first.** The Forward Worker in this repository was built on the hypothesis that SSE response streaming defeats Gateway DLP. That hypothesis has **not been verified**, and Anthropic's own documentation points at a different, request-side cause with a documented one-line fix. **Start with Section 2 (five minutes). Only if that does not resolve it, proceed to the full diagnostic in Section 2b.** The Worker is very likely unnecessary.
 
 ---
 
 ## Table of Contents
 
 1. [What We Know](#1-what-we-know)
-2. [Root Cause Diagnostic -- Run This First](#2-root-cause-diagnostic----run-this-first)
+2. [Quick Fix -- Try This First (5 minutes)](#2-quick-fix----try-this-first-5-minutes)
+2b. [Full Diagnostic (only if the quick fix did not work)](#2b-full-diagnostic-only-if-the-quick-fix-did-not-work)
 3. [Prerequisites](#3-prerequisites)
 4. [Phase 1 -- Gateway Foundation](#4-phase-1----gateway-foundation)
 5. [Phase 2 -- Claude Desktop Chat (Reference, Already Working)](#5-phase-2----claude-desktop-chat-reference-already-working)
@@ -44,7 +45,7 @@ Cowork is not a separate product in this respect. Anthropic's documentation stat
 
 ### Four candidate causes
 
-The working and failing surfaces differ in several ways at once. Any one of these could be the cause, and the diagnostic in Section 2 isolates them one at a time:
+The working and failing surfaces differ in several ways at once. Any one of these could be the cause. The quick fix in Section 2 tests the leading one directly; the full diagnostic in Section 2b isolates all four:
 
 | # | Candidate cause | Direction affected | Evidence for it | Fix if confirmed |
 |---|---|---|---|---|
@@ -53,11 +54,71 @@ The working and failing surfaces differ in several ways at once. Any one of thes
 | **C** | **Request body too large for the DLP scan window.** Claude Code sends full file contents, tool schemas, and conversation history -- bodies of 50 KB to several MB. The user's prompt may sit past whatever portion Gateway scans. | Request | Plausible but unconfirmed. Gateway's body-scan limits are not publicly documented. | Worker's schema-aware extraction (pulls user text from `messages[]` regardless of total body size), or request Gateway limit increase. |
 | **D** | **SSE response streaming.** Response text arrives as many small `text_delta` events; a pattern spanning events might not match. This was the **original hypothesis** and the reason the Worker was built. | **Response only** | Weakened: Claude Code's request-side DLP failing cannot be explained by a response-format issue. Only relevant if response-side DLP is in scope. | Forward Worker's SSE reassembly. |
 
-**Cause B is now the leading hypothesis.** It is the only one that (a) exactly fits the working/failing split, (b) is documented by the vendor as a known interaction with TLS-inspecting proxies, and (c) explains a *request-side* failure, which is what "DLP policy isn't matching on the prompt" describes. Cause D cannot explain a request-side failure at all.
+**Cause B is the leading hypothesis.** It is the only one that (a) exactly fits the working/failing split, (b) is documented by the vendor as a known interaction with TLS-inspecting proxies, and (c) explains a *request-side* failure, which is what "DLP policy isn't matching on the prompt" describes. Cause D cannot explain a request-side failure at all.
+
+### Why Cause B fits so precisely
+
+Anthropic's environment variable reference for `CLAUDE_CODE_GZIP_REQUEST_BODIES` (verbatim):
+
+> *"By default, Claude Code compresses large request bodies on direct connections and skips compression when you send requests through a proxy, configure a client certificate, or set `NODE_EXTRA_CA_CERTS`. Use `0` if a TLS-inspecting proxy that Claude Code can't detect mishandles compressed requests."*
+
+Three consequences for AMS:
+
+1. **The Cloudflare One Client is "a TLS-inspecting proxy that Claude Code can't detect."** It is a transparent WARP tunnel -- there is no `HTTPS_PROXY` variable or anything else in the process environment for Claude Code to notice. So Claude Code believes it is on a direct connection and compresses.
+2. **Every Claude Code request qualifies as "large."** Even a one-line prompt carries the system prompt and tool definitions, so compression is effectively always on.
+3. **Setting `NODE_EXTRA_CA_CERTS` turns compression off as a side effect.** This is a useful signal about AMS's earlier troubleshooting: if a tester had set `NODE_EXTRA_CA_CERTS` *inside WSL* and DLP still failed, that argues *against* Cause B. If it was set on the Windows side (where it does nothing for a WSL process) or not at all (relying on the Ubuntu system store, which is correct for trust but leaves compression on), Cause B remains fully consistent.
+
+Cloudflare's documentation does not state whether Gateway DLP decompresses gzip request bodies before pattern matching. That is the one fact the quick fix below tests empirically.
 
 ---
 
-## 2. Root Cause Diagnostic -- Run This First
+## 2. Quick Fix -- Try This First (5 minutes)
+
+This is one setting and one test prompt. No API keys, no curl, no policy changes.
+
+### Step 1 -- Turn off request compression in Claude Code
+
+Inside WSL Ubuntu, create or edit `~/.claude/settings.json`. If the file does not exist, create it with exactly this content. If it exists, add the `env` block (or add the key to an existing `env` block):
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_GZIP_REQUEST_BODIES": "0"
+  }
+}
+```
+
+Settings files are strict JSON -- no trailing commas, no comments.
+
+### Step 2 -- Restart Claude Code and send a test prompt
+
+Quit any running Claude Code session, then:
+
+```bash
+claude
+```
+
+Send this prompt: `My SSN is 078-05-1120, can you help me?`
+
+### Step 3 -- Check the Gateway log
+
+In **Zero Trust > Logs > Gateway > HTTP**, filter by the tester's email and the last 10 minutes. Find the request to `api.anthropic.com`.
+
+| What you see | Meaning | Next step |
+|---|---|---|
+| **Action: Block** and the DLP profile is listed as matched | **Cause B confirmed. Gzip was the problem.** | Roll the setting out to all testers via `~/.claude/settings.json`, and to the fleet via managed settings (Phase 3, step 6.0). Do the same on the host OS for Cowork (Phase 3b). **No Worker is needed.** Skip to Phase 6 for validation. |
+| **Action: Allow**, no DLP match, but the request *does* appear | Gzip was not the (only) problem. | Go to Section 2b, starting at Test 2. |
+| The request **does not appear** in the log at all | Traffic is not reaching Gateway from WSL. | Go to Phase 3, steps 6.1 and 6.2 (WSL networking and certificate), then retry this quick fix. |
+
+### Step 4 -- Repeat for Cowork
+
+On the **host OS** (not WSL), add the same `env` block to `~/.claude/settings.json` (Windows: `%USERPROFILE%\.claude\settings.json`), restart Claude Desktop, send the same prompt from Cowork, and check the log the same way.
+
+> **If the quick fix works:** you have confirmed the root cause with a single observable change, and the remediation for 200 seats is a one-key addition to managed settings. The rest of this guide -- the Worker, the Forward policy, the R2 logging -- is not needed. Keep the repository as a record of the investigation and as a fallback if a future Claude Code release changes behavior.
+
+---
+
+## 2b. Full Diagnostic (only if the quick fix did not work)
 
 Work through these tests in order. Each one isolates a single variable. Record the result of each before moving on; the decision table at the end tells you which fix to apply and whether the Worker is needed.
 
@@ -244,7 +305,7 @@ After applying whichever fix the tests above indicated:
 
 ## 2b. The Forward Worker (Conditional)
 
-**Deploy only if the diagnostic confirms Cause C or Cause D.** If it confirms A or B, the fix is a policy change or a client setting, and the Worker adds operational complexity for no benefit.
+**Deploy only if the Section 2b diagnostic confirms Cause C or Cause D.** If it confirms A or B, the fix is a policy change or a client setting, and the Worker adds operational complexity for no benefit.
 
 The Worker is a **Gateway Forward Worker** (Programmable Gateway) that intercepts `api.anthropic.com` traffic after TLS decryption. It:
 
@@ -337,7 +398,7 @@ This is the most common cause of "DLP doesn't fire" issues. Check that no existi
    - Host: `api.anthropic.com`, `claude.ai`, or `*.anthropic.com`
 3. If found, either **remove** it or **narrow** it so it doesn't cover `api.anthropic.com`
 
-> **Why this matters:** Do Not Inspect policies are evaluated before all other HTTP policies regardless of their position in the list. If Anthropic traffic matches a Do Not Inspect rule, Gateway will not decrypt it, the Forward Worker will never be invoked, and DLP will not function. This is a common, silent cause of "DLP isn't matching" and should be ruled out before any other troubleshooting. Note: the original AMS symptom ("Gateway IS decrypting but policy isn't matching") is inconsistent with a Do Not Inspect match -- and the fact that Claude web and Desktop chat work confirms Anthropic hosts are being decrypted. This step is a sanity check only; the real diagnosis is in Section 2.
+> **Why this matters:** Do Not Inspect policies are evaluated before all other HTTP policies regardless of their position in the list. If Anthropic traffic matches a Do Not Inspect rule, Gateway will not decrypt it, the Forward Worker will never be invoked, and DLP will not function. This is a common, silent cause of "DLP isn't matching" and should be ruled out before any other troubleshooting. Note: the original AMS symptom ("Gateway IS decrypting but policy isn't matching") is inconsistent with a Do Not Inspect match -- and the fact that Claude web and Desktop chat work confirms Anthropic hosts are being decrypted. This step is a sanity check only; the real diagnosis is in Sections 2 and 2b.
 
 ### 4.3 Download the Cloudflare Root Certificate
 
@@ -362,13 +423,13 @@ For detailed instructions per OS, see [Install certificate manually](https://dev
 
 ## 5. Phase 2 -- Claude Desktop Chat (Reference, Already Working)
 
-AMS reports that DLP already works for the Claude Desktop **chat** tab. This phase exists only as a reference point for the diagnostic. No changes are needed.
+AMS reports that DLP already works for the Claude Desktop **chat** tab. This phase exists only as a reference point for the full diagnostic (Section 2b). No changes are needed.
 
 Claude Desktop's chat tab is an Electron (Chromium) UI. It uses the host OS certificate store, does not pin certificates, and -- like a browser -- sends plain, uncompressed JSON request bodies. The Code tab and Cowork inside the same app are different: they run the Claude Code engine, which has its own network behavior (Phase 3 and 3b).
 
 ### 5.1 Capture the reference log entry
 
-As part of Test 1 in the diagnostic, record the Gateway HTTP log entry for a Desktop chat request. The fields that matter for comparison are **Host**, **Request Content-Encoding**, **Response Content-Type**, and **DLP profile matched**. This is the known-good baseline the failing surfaces are compared against.
+If you reach the full diagnostic (Section 2b, Test 1), record the Gateway HTTP log entry for a Desktop chat request. The fields that matter for comparison are **Host**, **Request Content-Encoding**, **Response Content-Type**, and **DLP profile matched**. This is the known-good baseline the failing surfaces are compared against.
 
 ---
 
@@ -382,7 +443,7 @@ Claude Code gzip-compresses request bodies to the Claude API by default. Anthrop
 
 > *"If such a [TLS-inspection] proxy mishandles gzip-compressed request bodies, set `CLAUDE_CODE_GZIP_REQUEST_BODIES=0` to turn off compression for Claude API, telemetry, and artifact publish requests."*
 
-If Test 3 in the diagnostic confirmed Cause B, this is the fix. Set it in Claude Code's settings rather than the shell so it also reaches Cowork and background agents:
+If the quick fix (Section 2) or Test 3 (Section 2b) confirmed Cause B, this is the fix to roll out. Set it in Claude Code's settings rather than the shell so it also reaches Cowork and background agents:
 
 **Per-user (for the POC):** add to `~/.claude/settings.json` inside WSL:
 ```json
@@ -546,7 +607,7 @@ Send a prompt containing the test SSN from Cowork. In the Gateway HTTP log, conf
 
 ## 8. Phase 4 -- Deploy the Forward Worker (Only If Diagnostic Confirms Cause C or D)
 
-> **Gate:** Do not proceed with this phase unless the Section 2 diagnostic produced one of these results:
+> **Gate:** Do not proceed with this phase unless the Section 2b diagnostic produced one of these results:
 > - **Test 4:** small body blocked, large body allowed (Cause C -- oversized request bodies)
 > - **Test 5:** JSON response blocked, SSE response allowed (Cause D -- SSE responses not scanned)
 >
