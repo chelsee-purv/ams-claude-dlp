@@ -1,31 +1,30 @@
 /**
  * AMS Claude DLP – Gateway Forward Worker
  *
- * DEPLOY ONLY IF THE DIAGNOSTIC IN DEPLOY.md SECTION 2 CONFIRMS CAUSE C OR D.
- * If the root cause is policy scope (Cause A) or gzip request bodies (Cause B),
- * this Worker is unnecessary -- fix the policy or set
- * CLAUDE_CODE_GZIP_REQUEST_BODIES=0 on clients instead.
+ * This Worker is the DLP enforcement point for Claude Code and Cowork traffic
+ * to api.anthropic.com. Native Gateway DLP was observed returning Allow on
+ * Claude Code requests containing test SSNs even after gzip was disabled, so
+ * this Worker performs its own inspection rather than relying on Gateway's
+ * body scan. It uses regex pattern matching, NOT the Cloudflare DLP engine.
  *
- * Intercepts Claude API traffic (api.anthropic.com) and performs supplementary
- * regex-based DLP inspection (NOT the Cloudflare DLP engine) on:
- *   1. REQUEST bodies  – parses the Messages API JSON and scans only the
- *      user-authored text in messages[].content and system, so the prompt is
- *      inspected regardless of total body size (addresses Cause C)
- *   2. RESPONSE bodies – reassembles SSE text_delta events and scans the
- *      accumulated text at content_block_stop boundaries (addresses Cause D,
- *      which is UNVERIFIED -- see DEPLOY.md Test 5)
+ * Request side (the primary control -- what users send to Claude):
+ *   - Decompresses gzip/deflate/br request bodies. Claude Code compresses by
+ *     default and a client missing the managed setting must not bypass scanning.
+ *   - Parses the Messages API JSON and extracts every user-authored text field:
+ *     messages[].content (string or text/tool_result blocks) and system.
+ *     Tool schemas and assistant turns are skipped so a 500 KB body with a
+ *     one-line prompt is scanned for exactly that prompt.
+ *   - FAILS CLOSED: a body that cannot be decoded, parsed, or that exceeds
+ *     REQUEST_BODY_LIMIT is blocked, not passed through.
  *
- * This Worker does NOT decompress gzip request bodies. Clients must have
- * CLAUDE_CODE_GZIP_REQUEST_BODIES=0 set for request-side inspection to work.
+ * Response side (secondary -- what Claude sends back):
+ *   - SSE streams are passed through in real time while text_delta events are
+ *     accumulated and scanned at content_block_stop boundaries.
+ *   - Non-streaming JSON responses are buffered and scanned.
  *
- * Architecture:
- *   - The Worker streams the response to the client in real time (no buffering delay).
- *   - In parallel, it accumulates text deltas into a buffer.
- *   - At content_block_stop boundaries and at message_stop, it runs DLP scans
- *     on the accumulated text.
- *   - If a violation is detected mid-stream, the Worker terminates the stream
- *     and injects an SSE error event telling the client the response was blocked.
- *   - Violations are logged to R2 for audit.
+ * Every decision sets an x-dlp-decision response header (pass | block | error)
+ * so the outcome is visible in Gateway HTTP logs without opening Workers Logs.
+ * Violations are additionally written to R2 for audit.
  *
  * Deploy with: npx wrangler deploy
  * Scope with a Gateway Forward policy matching:
@@ -46,12 +45,20 @@ interface Env {
   DLP_LOGS: R2Bucket;
 }
 
-/** Maximum request body size we'll buffer for inspection (512 KiB). */
-const REQUEST_BODY_LIMIT = 512 * 1024;
+/**
+ * Maximum DECODED request body size to inspect (8 MiB). Claude Code bodies
+ * carry full conversation history, tool schemas, and file contents; 1-3 MiB is
+ * routine. A body over this limit is BLOCKED (fail closed), never passed.
+ * Workers have 128 MiB of memory per isolate; 8 MiB leaves ample headroom.
+ */
+const REQUEST_BODY_LIMIT = 8 * 1024 * 1024;
 
 /** Maximum accumulated response text before we stop buffering (2 MiB).
  *  Claude responses can be long; we cap to avoid OOM. */
 const RESPONSE_TEXT_LIMIT = 2 * 1024 * 1024;
+
+/** Response header that records the Worker's decision for every request. */
+const DECISION_HEADER = "x-dlp-decision";
 
 // ---------------------------------------------------------------------------
 // DLP Patterns
@@ -198,46 +205,73 @@ function scanForViolations(text: string, minEndIndex = 0): Violation[] {
   return violations;
 }
 
-/**
- * Read and buffer a request body up to a size limit.
- * Returns the body text, or null if the body is too large, compressed, or not JSON.
- * Always drains/cancels the provided stream so the tee'd clone does not leak.
- */
-async function bufferRequestBody(request: Request): Promise<string | null> {
-  if (!request.body) return null;
-  const contentType = request.headers.get("content-type") ?? "";
+/** Outcome of reading a request body. Only `ok` carries text. */
+type BodyRead =
+  | { kind: "ok"; text: string; encodedBytes: number; decodedBytes: number }
+  | { kind: "empty" }
+  | { kind: "unsupported-encoding"; encoding: string }
+  | { kind: "not-json"; contentType: string }
+  | { kind: "too-large"; decodedBytes: number }
+  | { kind: "decode-error"; message: string };
 
-  if (!/^application\/json\b/i.test(contentType) || request.headers.has("content-encoding")) {
-    console.warn("Skipping request DLP: unsupported content-type or encoded body", {
-      contentType,
-      encoding: request.headers.get("content-encoding"),
-    });
+/**
+ * Read, decompress, and buffer a request body up to REQUEST_BODY_LIMIT
+ * (measured on the DECODED bytes). Handles gzip, deflate, and br via the
+ * platform DecompressionStream so a client that still compresses is inspected
+ * rather than skipped. Returns a discriminated result so the caller can fail
+ * closed on every non-ok outcome.
+ */
+async function readRequestBody(request: Request): Promise<BodyRead> {
+  if (!request.body) return { kind: "empty" };
+
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!/^application\/json\b/i.test(contentType)) {
     void request.body.cancel().catch(() => {});
-    return null;
+    return { kind: "not-json", contentType };
   }
 
-  const reader = request.body.getReader();
+  // Claude Code sends gzip. DecompressionStream in Workers supports gzip and
+  // deflate only (no Brotli). Any other encoding is a block, not a pass.
+  const encoding = (request.headers.get("content-encoding") ?? "").trim().toLowerCase();
+  let stream: ReadableStream<Uint8Array> = request.body;
+  if (encoding && encoding !== "identity") {
+    if (encoding !== "gzip" && encoding !== "deflate") {
+      void request.body.cancel().catch(() => {});
+      return { kind: "unsupported-encoding", encoding };
+    }
+    stream = request.body.pipeThrough(new DecompressionStream(encoding));
+  }
+
+  const reader = stream.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
-  let size = 0;
+  let decodedBytes = 0;
   let text = "";
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      size += value.byteLength;
-      if (size > REQUEST_BODY_LIMIT) {
+      decodedBytes += value.byteLength;
+      if (decodedBytes > REQUEST_BODY_LIMIT) {
         void reader.cancel().catch(() => {});
-        return null; // Too large; let standard Gateway DLP handle it
+        return { kind: "too-large", decodedBytes };
       }
       text += decoder.decode(value, { stream: true });
     }
     text += decoder.decode();
-  } catch {
-    return null;
+  } catch (err) {
+    void reader.cancel().catch(() => {});
+    return { kind: "decode-error", message: err instanceof Error ? err.message : String(err) };
   } finally {
     reader.releaseLock();
   }
-  return text;
+
+  const encodedLen = Number(request.headers.get("content-length"));
+  return {
+    kind: "ok",
+    text,
+    encodedBytes: Number.isFinite(encodedLen) ? encodedLen : decodedBytes,
+    decodedBytes,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +431,101 @@ function createDlpInspectionStream(
 }
 
 // ---------------------------------------------------------------------------
+// Messages API text extraction
+// ---------------------------------------------------------------------------
+
+/**
+ * Pull every user-authored or user-supplied text field out of a Messages API
+ * request body. Scanning only these fields -- rather than the whole JSON --
+ * means a 2 MB body with tool schemas and conversation history is scanned for
+ * exactly what the user typed or what Claude Code read from disk on the user's
+ * behalf, with no size-related gaps.
+ *
+ * Included:
+ *   - system (string or text blocks) -- Claude Code puts CLAUDE.md here
+ *   - messages[role=user].content as a string
+ *   - messages[role=user].content[].text        (what the user typed)
+ *   - messages[role=user].content[].tool_result (file contents, command output
+ *     that Claude Code read and is sending to the model)
+ *
+ * Excluded by design:
+ *   - messages[role=assistant] -- model output already seen; response-side
+ *     inspection covers new output
+ *   - tools[].input_schema -- JSON Schema, not user data
+ *   - image/document blocks -- base64, not scannable as text
+ *
+ * Returns the concatenated text, or null if the body is not a Messages API
+ * request object (the caller treats null as a block).
+ */
+export function extractUserText(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const p = payload as Record<string, unknown>;
+  const parts: string[] = [];
+
+  const pushBlocks = (blocks: unknown) => {
+    if (typeof blocks === "string") {
+      parts.push(blocks);
+      return;
+    }
+    if (!Array.isArray(blocks)) return;
+    for (const b of blocks) {
+      if (!b || typeof b !== "object") continue;
+      const blk = b as Record<string, unknown>;
+      if (blk.type === "text" && typeof blk.text === "string") {
+        parts.push(blk.text);
+      } else if (blk.type === "tool_result") {
+        // content may be a string or an array of text blocks
+        pushBlocks(blk.content);
+      }
+    }
+  };
+
+  pushBlocks(p.system);
+
+  if (Array.isArray(p.messages)) {
+    for (const m of p.messages) {
+      if (!m || typeof m !== "object") continue;
+      const msg = m as Record<string, unknown>;
+      if (msg.role === "user") pushBlocks(msg.content);
+    }
+  }
+
+  return parts.join("\n");
+}
+
+/**
+ * Return a copy of an upstream response with the decision header set.
+ * Upstream Response headers are immutable, so copy into a new Response.
+ */
+function withDecision(response: Response, decision: string): Response {
+  const headers = new Headers(response.headers);
+  headers.set(DECISION_HEADER, decision);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+/** Build the error response returned when the Worker blocks a request. */
+function blockedResponse(reason: string, detail: string, status = 400): Response {
+  return new Response(
+    JSON.stringify({
+      type: "error",
+      error: { type: "dlp_violation", message: detail },
+    }),
+    {
+      status,
+      headers: {
+        "content-type": "application/json",
+        [DECISION_HEADER]: `block;${reason}`,
+        "cache-control": "no-store",
+      },
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main GatewayMiddleware
 // ---------------------------------------------------------------------------
 
@@ -406,88 +535,70 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
     context: GatewayMiddlewareContext,
     next: GatewayMiddlewareNext,
   ): Promise<Response> {
-    // Only inspect POST requests to Claude's message endpoints
+    // Only inspect the Messages endpoint. count_tokens is a dry-run that
+    // carries the same body but produces no model output; skipping it avoids
+    // double-counting violations in logs.
     const url = new URL(request.url);
     if (
       request.method !== "POST" ||
-      !url.pathname.startsWith("/v1/messages")
+      url.pathname !== "/v1/messages"
     ) {
       return next(request);
     }
 
     // -----------------------------------------------------------------------
-    // STEP 1: Inspect the REQUEST body (user prompt to Claude)
+    // STEP 1: Inspect the REQUEST body (what the user is sending to Claude).
+    // This is the primary control. Every non-ok outcome fails closed.
     // -----------------------------------------------------------------------
-    // Clone so we can read the body without consuming the original
-    const requestClone = request.clone();
-    const requestBody = await bufferRequestBody(requestClone);
+    const read = await readRequestBody(request.clone());
 
-    if (requestBody) {
-      // Extract user message content from the Claude API request
-      try {
-        const payload = JSON.parse(requestBody);
-        let userText = "";
+    if (read.kind !== "ok") {
+      // "empty" is the only non-ok case that is safe to forward: a POST with
+      // no body cannot contain sensitive data.
+      if (read.kind === "empty") return this.passThrough(next, request, "empty-body");
 
-        // Claude Messages API: messages is an array of {role, content}
-        if (Array.isArray(payload.messages)) {
-          for (const msg of payload.messages) {
-            if (msg.role === "user") {
-              if (typeof msg.content === "string") {
-                userText += msg.content + "\n";
-              } else if (Array.isArray(msg.content)) {
-                for (const block of msg.content) {
-                  if (block.type === "text" && block.text) {
-                    userText += block.text + "\n";
-                  }
-                }
-              }
-            }
-          }
-        }
+      const detail =
+        read.kind === "too-large"
+          ? `Request body (${Math.round(read.decodedBytes / 1024)} KiB) exceeds the inspectable limit. Shorten the conversation or reduce attached context and retry.`
+          : read.kind === "unsupported-encoding"
+            ? `Request uses Content-Encoding "${read.encoding}", which cannot be inspected.`
+            : read.kind === "not-json"
+              ? `Request Content-Type "${read.contentType}" is not inspectable JSON.`
+              : `Request body could not be decoded for inspection: ${read.message}`;
 
-        // Also check the system prompt
-        if (typeof payload.system === "string") {
-          userText += payload.system + "\n";
-        } else if (Array.isArray(payload.system)) {
-          for (const block of payload.system) {
-            if (block.type === "text" && block.text) {
-              userText += block.text + "\n";
-            }
-          }
-        }
+      this.ctx.waitUntil(
+        this.logViolation(context, "request-uninspectable", [{ pattern: read.kind, match: "" }], request.url, detail),
+      );
+      return blockedResponse(read.kind, detail, read.kind === "too-large" ? 413 : 400);
+    }
 
-        if (userText) {
-          const violations = scanForViolations(userText);
-          if (violations.length > 0) {
-            // Log the violation
-            await this.logViolation(context, "request", violations, request.url);
+    let payload: unknown;
+    try {
+      payload = JSON.parse(read.text);
+    } catch {
+      this.ctx.waitUntil(
+        this.logViolation(context, "request-uninspectable", [{ pattern: "invalid-json", match: "" }], request.url),
+      );
+      return blockedResponse("invalid-json", "Request body is not valid JSON and cannot be inspected.");
+    }
 
-            // Return a Claude-compatible error response
-            return new Response(
-              JSON.stringify({
-                type: "error",
-                error: {
-                  type: "dlp_violation",
-                  message:
-                    "Request blocked: your message contains sensitive data that cannot be sent " +
-                    `to external AI services. ${violations.length} violation(s) detected: ` +
-                    `${violations.map((v) => v.pattern).join(", ")}. ` +
-                    "Please remove sensitive data and try again.",
-                },
-              }),
-              {
-                status: 400,
-                headers: {
-                  "content-type": "application/json",
-                  "x-dlp-blocked": "true",
-                },
-              },
-            );
-          }
-        }
-      } catch {
-        // JSON parse failed -- let it pass through, standard Gateway DLP covers it
-      }
+    const userText = extractUserText(payload);
+    if (userText === null) {
+      this.ctx.waitUntil(
+        this.logViolation(context, "request-uninspectable", [{ pattern: "not-messages-api", match: "" }], request.url),
+      );
+      return blockedResponse("not-messages-api", "Request body is not a Messages API object.");
+    }
+
+    const violations = scanForViolations(userText);
+    if (violations.length > 0) {
+      this.ctx.waitUntil(this.logViolation(context, "request", violations, request.url, userText));
+      return blockedResponse(
+        "pattern-match",
+        "Request blocked: your message contains sensitive data that cannot be sent to external AI services. " +
+          `${violations.length} violation(s) detected: ${violations.map((v) => v.pattern).join(", ")}. ` +
+          "Remove the sensitive data and try again.",
+      );
     }
 
     // -----------------------------------------------------------------------
@@ -499,23 +610,24 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
     const contentType = response.headers.get("content-type") ?? "";
     const isSSE = contentType.includes("text/event-stream");
 
-    // If the upstream body is compressed we cannot parse it as text. Pass it
-    // through untouched rather than risk corrupting the stream. Anthropic
-    // does not compress SSE in practice, but guard against it anyway.
-    if (response.headers.has("content-encoding")) {
-      console.warn("Skipping response DLP: upstream body is content-encoded", {
-        encoding: response.headers.get("content-encoding"),
-        contentType,
-      });
-      return response;
+    // Upstream error responses (4xx/5xx) carry no model output. Pass them
+    // through with the request-side decision recorded.
+    if (!response.ok || !response.body) {
+      return withDecision(response, "pass;request-clean;upstream-" + response.status);
     }
 
-    if (!isSSE || !response.body) {
-      // Non-streaming response -- buffer and scan the JSON body
-      if (/^application\/json\b/i.test(contentType) && response.body) {
+    // If the upstream body is compressed we cannot parse it as text. Anthropic
+    // does not compress SSE in practice; if it ever does, record it and pass
+    // through rather than corrupt the stream. Request-side has already passed.
+    if (response.headers.has("content-encoding")) {
+      return withDecision(response, "pass;request-clean;response-encoded");
+    }
+
+    if (!isSSE) {
+      if (/^application\/json\b/i.test(contentType)) {
         return this.inspectJsonResponse(response, context);
       }
-      return response;
+      return withDecision(response, "pass;request-clean;response-not-json");
     }
 
     // -----------------------------------------------------------------------
@@ -533,12 +645,22 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
     // transfer.
     const headers = new Headers(response.headers);
     headers.delete("content-length");
+    headers.set(DECISION_HEADER, "pass;request-clean;response-stream-inspected");
 
     return new Response(response.body.pipeThrough(transform), {
       status: response.status,
       statusText: response.statusText,
       headers,
     });
+  }
+
+  /** Forward unchanged and stamp the decision header on the response. */
+  private async passThrough(
+    next: GatewayMiddlewareNext,
+    request: Request,
+    reason: string,
+  ): Promise<Response> {
+    return withDecision(await next(request), `pass;${reason}`);
   }
 
   /**
@@ -560,14 +682,14 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
         if (done) break;
         size += value.byteLength;
         if (size > RESPONSE_TEXT_LIMIT) {
-          // Too large -- return original, rely on standard DLP
-          return response;
+          void reader.cancel().catch(() => {});
+          return withDecision(response, "pass;request-clean;response-too-large");
         }
         text += decoder.decode(value, { stream: true });
       }
       text += decoder.decode();
     } catch {
-      return response;
+      return withDecision(response, "pass;request-clean;response-decode-error");
     } finally {
       reader.releaseLock();
     }
@@ -584,7 +706,7 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
         }
       }
     } catch {
-      return response;
+      return withDecision(response, "pass;request-clean;response-not-json");
     }
 
     if (responseText) {
@@ -609,14 +731,15 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
             status: 200, // Return 200 so the client doesn't retry
             headers: {
               "content-type": "application/json",
-              "x-dlp-blocked": "true",
+              [DECISION_HEADER]: "block;response-pattern-match",
+              "cache-control": "no-store",
             },
           },
         );
       }
     }
 
-    return response;
+    return withDecision(response, "pass;request-clean;response-clean");
   }
 
   /**
