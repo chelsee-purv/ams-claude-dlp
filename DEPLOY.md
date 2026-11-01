@@ -7,7 +7,7 @@
 | **Scope** | DLP enforcement on Claude Code (WSL Ubuntu) and Cowork traffic to `api.anthropic.com`, using Secure Web Gateway with a Forward Worker as the inspection point. Claude web and Claude Desktop chat already work with native Gateway DLP and are out of scope. |
 | **Active testers** | 9 users in developer environments |
 | **Worker source** | `<GITHUB_URL>` -- replace before sharing |
-| **Architecture decision** | Secure Web Gateway + Forward Worker. AI Gateway is not used for this POC. |
+| **Architecture decision** | Secure Web Gateway + Forward Worker. Cloudflare also offers a native path via AI Gateway with DLP; see [Section 1](#the-native-alternative-ai-gateway-with-dlp) for the comparison and why SWG was chosen. |
 
 ---
 
@@ -37,6 +37,39 @@
 Native Gateway DLP matches on Claude web and Claude Desktop chat. On Claude Code and Cowork it does not: the Gateway HTTP log shows **Action: Allow** with no DLP profile match on requests that contain a test SSN. This persisted after disabling Claude Code's gzip request compression, so compression is not the cause. The remaining candidates (policy host scope, request body size, JSON-encoded body structure) are all things Gateway's generic body scan may handle differently from a chat form post; see the [appendix](#14-appendix----investigation-history) for the full list.
 
 Rather than continue isolating which Gateway-side factor is responsible, this POC makes the **Forward Worker the DLP enforcement point** for `api.anthropic.com`. The Worker understands the Messages API body structure, decompresses it if needed, extracts exactly the user-authored text, and scans that. It does not depend on how Gateway's native scan treats the body.
+
+### The native alternative: AI Gateway with DLP
+
+Cloudflare has a purpose-built product for this traffic. **AI Gateway** is a proxy for LLM API calls that runs the same Cloudflare DLP profiles AMS already manages in the Zero Trust dashboard. From Cloudflare's AI Gateway DLP documentation:
+
+> *"AI Gateway DLP uses the same detection profiles as Cloudflare One's DLP solution. Profiles are shared account-level objects, so you can reuse existing predefined or custom profiles."*
+>
+> *"Streaming (SSE) responses: DLP buffers the full streamed response before scanning."*
+>
+> *"Tool call arguments and results: DLP scans the text content present in the message body."*
+>
+> *"No Gateway proxy or TLS decryption required."*
+
+Claude Code is routed to it with one managed setting, `ANTHROPIC_BASE_URL`, and can be pinned there with `allowedProviders: ["customEndpoint"]` so developers cannot bypass it.
+
+| | AI Gateway with DLP | Secure Web Gateway + Forward Worker (this guide) |
+|---|---|---|
+| DLP engine | **Cloudflare DLP** -- dashboard profiles, EDM, wordlists, confidence thresholds | Regex patterns in Worker code |
+| Pattern management | Dashboard, shared with the rest of the org | Edit `src/index.ts`, redeploy |
+| SSE response handling | Buffers full response, then scans (documented) | Streams through, scans at block boundaries |
+| TLS decryption dependency | None | Required |
+| Traffic path | Client -> AI Gateway -> Anthropic | Client -> Cloudflare One Client -> Gateway -> Anthropic |
+| Billing model | Routes through an org-held Anthropic API key; developer traffic billed per-token to that key, not to claude.ai subscription seats | No change to how developers authenticate or are billed |
+| Logs | AI Gateway logs | Gateway HTTP logs + R2 |
+| Coverage | Only clients configured with the base URL | Any client on an enrolled device hitting `api.anthropic.com` |
+
+**AMS has chosen Secure Web Gateway + Forward Worker for this POC.** The deciding factors:
+
+1. **Single enforcement plane.** AMS is evaluating Zero Trust as a Proofpoint replacement. Keeping Claude Code enforcement inside the same Gateway that already covers Claude web, Desktop chat, and all other SaaS traffic means one policy surface, one log, one set of identity and device-posture conditions.
+2. **Device-based coverage.** The Forward Worker applies to every request from an enrolled device, regardless of client configuration. AI Gateway applies only to clients that have been pointed at it. For a 200-seat developer rollout, device enrollment is the control AMS already has.
+3. **Authentication model.** Routing through AI Gateway changes how Claude Code authenticates (org API key instead of individual claude.ai logins) and therefore how usage is billed. That is a procurement and licensing conversation AMS has not had yet, and is out of scope for a DLP POC.
+
+The trade-off is explicit: the Worker's patterns are code-managed rather than dashboard-managed. Section 11 covers how to keep them aligned with the dashboard profiles. If after the POC AMS wants dashboard-managed DLP for Claude Code, AI Gateway is the documented path, and the Worker can be retired without changing anything else in the Gateway configuration.
 
 ### Traffic flow
 
@@ -435,6 +468,6 @@ For the record, the sequence that led to the Worker-as-control decision:
    - Policy host scope -- a DLP policy scoped to `Application is Claude` may not include `api.anthropic.com`
    - Request body size -- Gateway's body-scan window is not publicly documented; Claude Code bodies are large
    - JSON encoding -- the prompt sits inside nested JSON strings; proximity-keyword confidence scoring may behave differently than on form posts
-5. **Decision:** make the Worker the control. It handles all three remaining candidates by construction (host-scoped Forward policy, schema-aware extraction with no size dependency, parses JSON before scanning). AI Gateway with DLP was identified as an alternative architecture with documented SSE buffering, but was not selected for this POC.
+5. **Decision:** make the Worker the control. It handles all three remaining candidates by construction (host-scoped Forward policy, schema-aware extraction with no size dependency, parses JSON before scanning). AI Gateway with DLP was identified as the native alternative (Section 1) and deliberately not selected for this POC for the reasons stated there.
 
 If the Gateway-side root cause is still of interest after the POC, three `curl` tests isolate it: plain body to `api.anthropic.com` (host scope), 300 KB body (size), and a body with the SSN inside a `tool_result` block (encoding). Each is a five-minute check against the Gateway HTTP log with the Forward policy temporarily disabled.
