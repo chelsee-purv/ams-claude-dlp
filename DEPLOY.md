@@ -6,7 +6,7 @@
 | **Use case** | 200-seat Zero Trust / DLP POC displacing Proofpoint |
 | **Scope** | DLP enforcement on Claude Code (WSL Ubuntu) and Cowork traffic to `api.anthropic.com`, using Secure Web Gateway with a Forward Worker as the inspection point. Claude web and Claude Desktop chat already work with native Gateway DLP and are out of scope. |
 | **Active testers** | 9 users in developer environments |
-| **Worker source** | https://gitlab.cfdata.org/chelsee/ams-claude-dlp |
+| **Worker source** | `<GITHUB_URL>` -- replace before sharing |
 | **Architecture decision** | Secure Web Gateway + Forward Worker. AI Gateway is not used for this POC. |
 
 ---
@@ -228,7 +228,7 @@ Send a prompt from Cowork. The request appears in the Gateway HTTP log with Host
 ## 7. Phase 4 -- Deploy the Worker
 
 ```bash
-git clone git@gitlab.cfdata.org:chelsee/ams-claude-dlp.git
+git clone <GITHUB_URL>
 cd ams-claude-dlp
 npm install
 npm run typecheck                       # tsc --noEmit
