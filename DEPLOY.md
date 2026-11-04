@@ -7,7 +7,7 @@
 | **Scope** | DLP enforcement on Claude Code (WSL Ubuntu) and Cowork traffic to `api.anthropic.com`, using Secure Web Gateway with a Forward Worker as the inspection point. Claude web and Claude Desktop chat already work with native Gateway DLP and are out of scope. |
 | **Active testers** | 9 users in developer environments |
 | **Worker source** | https://github.com/chelsee-purv/ams-claude-dlp |
-| **Architecture decision** | Secure Web Gateway + Forward Worker. Cloudflare also offers a native path via AI Gateway with DLP; see [Section 1](#the-native-alternative-ai-gateway-with-dlp) for the comparison and why SWG was chosen. |
+| **Architecture decision** | Forward Worker for POC enforcement; AMS leaning toward AI Gateway with native DLP for production. See [Section 1](#1-architecture) for the full comparison and [Section 15](#15-alternative-ai-gateway-with-native-dlp) for the AI Gateway deployment guide. |
 
 ---
 
@@ -64,13 +64,17 @@ Claude Code is routed to it with one managed setting, `ANTHROPIC_BASE_URL`, and 
 | Logs | AI Gateway logs | Gateway HTTP logs + R2 |
 | Coverage | Only clients configured with the base URL | Any client on an enrolled device hitting `api.anthropic.com` |
 
-**AMS has chosen Secure Web Gateway + Forward Worker for this POC.** The deciding factors:
+**AMS is leaning toward AI Gateway as the production path.** The comparison below and the full AI Gateway deployment guide in [Section 15](#15-alternative-ai-gateway-with-native-dlp) reflect that direction. The Forward Worker remains documented here as the POC enforcement point and as a fallback if AI Gateway does not meet requirements.
 
-1. **Single enforcement plane.** AMS is evaluating Zero Trust as a Proofpoint replacement. Keeping Claude Code enforcement inside the same Gateway that already covers Claude web, Desktop chat, and all other SaaS traffic means one policy surface, one log, one set of identity and device-posture conditions.
-2. **Device-based coverage.** The Forward Worker applies to every request from an enrolled device, regardless of client configuration. AI Gateway applies only to clients that have been pointed at it. For a 200-seat developer rollout, device enrollment is the control AMS already has.
-3. **Authentication model.** Routing through AI Gateway changes how Claude Code authenticates (org API key instead of individual claude.ai logins) and therefore how usage is billed. That is a procurement and licensing conversation AMS has not had yet, and is out of scope for a DLP POC.
+The factors that favor AI Gateway for production:
 
-The trade-off is explicit: the Worker's patterns are code-managed rather than dashboard-managed. Section 11 covers how to keep them aligned with the dashboard profiles. If after the POC AMS wants dashboard-managed DLP for Claude Code, AI Gateway is the documented path, and the Worker can be retired without changing anything else in the Gateway configuration.
+1. **Dashboard-managed DLP.** AI Gateway uses the same Cloudflare DLP profiles already managed in the Zero Trust dashboard -- predefined detectors, EDM datasets, wordlists, and confidence thresholds -- without maintaining a separate regex set in code. Pattern changes take effect immediately without a Worker redeploy.
+2. **No TLS decryption dependency.** AI Gateway inspects traffic as a purpose-built LLM proxy. The Forward Worker requires TLS decryption to be on and working, which adds certificate trust complexity on WSL and Cowork.
+3. **Unified billing and access control.** AI Gateway centralises the Anthropic API key on the org account and supports Cloudflare Access in front of the gateway, so developer identity is captured at the AI layer without relying on device enrollment state.
+
+The remaining consideration is coverage: AI Gateway applies only to clients configured with `ANTHROPIC_BASE_URL`. A developer who removes that setting bypasses DLP. AMS is evaluating whether MDM-distributed managed settings and the `allowedProviders: ["customEndpoint"]` lock are sufficient controls for the developer population, or whether device-enrollment-based enforcement (the Worker path) is required as a backstop.
+
+The Worker's patterns are code-managed rather than dashboard-managed. Section 11 covers how to keep them aligned with the dashboard profiles if the Worker remains in use. The Worker can be retired without changing any other Gateway configuration once AI Gateway is in production.
 
 ### Traffic flow
 
