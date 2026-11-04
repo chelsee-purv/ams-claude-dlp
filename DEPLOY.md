@@ -127,7 +127,56 @@ Leave `apiKey` empty -- AI Gateway supplies credentials. For production, protect
 
 ---
 
-## A7. Validate
+## A7. Admin distribution (production)
+
+Developers should not configure this manually. The sections below cover how an admin pushes the AI Gateway config org-wide for each client.
+
+### Claude Code and Cowork
+
+Claude Code reads managed settings from the OS policy store. Push these via MDM (Intune, Jamf) or GPO -- developers never touch their local config. Cowork reads the same managed settings automatically; one push covers both.
+
+**macOS** -- deliver via MDM as a configuration profile targeting `com.anthropic.claudefordesktop`:
+
+```xml
+<key>env</key>
+<dict>
+  <key>ANTHROPIC_BASE_URL</key>
+  <string>https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic</string>
+  <key>ANTHROPIC_API_KEY</key>
+  <string><CF_AIG_TOKEN></string>
+  <key>ANTHROPIC_CUSTOM_HEADERS</key>
+  <string>cf-aig-authorization: Bearer <CF_AIG_TOKEN></string>
+  <key>allowedProviders</key>
+  <array><string>customEndpoint</string></array>
+</dict>
+```
+
+**Windows** -- deliver via GPO or Intune as registry keys under `HKLM\SOFTWARE\Policies\Claude`:
+
+| Value name | Type | Data |
+|---|---|---|
+| `ANTHROPIC_BASE_URL` | REG_SZ | `https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic` |
+| `ANTHROPIC_API_KEY` | REG_SZ | `<CF_AIG_TOKEN>` |
+| `ANTHROPIC_CUSTOM_HEADERS` | REG_SZ | `cf-aig-authorization: Bearer <CF_AIG_TOKEN>` |
+| `allowedProviders` | REG_SZ | `customEndpoint` |
+
+`allowedProviders: customEndpoint` is the enforcement lock -- it prevents Claude Code from connecting to any provider other than the configured `ANTHROPIC_BASE_URL`. Without it, the config is advisory and a developer can override it.
+
+### OpenCode
+
+OpenCode does not have an OS-level managed settings store like Claude Code. The recommended org-distribution mechanism is **Cloudflare Access + remote config**:
+
+1. Host an `opencode.json` at a public HTTPS URL (e.g. an R2 bucket with a custom domain).
+2. Protect the AI Gateway with Cloudflare Access.
+3. Developers run once: `opencode auth login https://<your-ai-gateway-domain>`. OpenCode fetches the remote config and obtains a short-lived Access token via `cloudflared` automatically on each session.
+
+No per-machine file editing is required after the initial login. Config changes (e.g. gateway token rotation) are picked up on the next session by updating the hosted file.
+
+If Access is not set up yet, push `~/.config/opencode/opencode.json` via MDM as an interim measure. See [A6](#a6-configure-opencode) for the file contents and the [OpenCode + Access docs](https://developers.cloudflare.com/ai-gateway/integrations/coding-agents/opencode/#use-with-cloudflare-access) for the full Access setup.
+
+---
+
+## A8. Validate
 
 Test SSN: `078-05-1120` (Woolworth wallet-card, invalid since the 1930s).
 
@@ -153,7 +202,7 @@ Repeat both tests from Claude Code and OpenCode directly.
 
 ---
 
-## A8. Logs and audit
+## A9. Logs and audit
 
 | Method | Location |
 |---|---|
