@@ -1,16 +1,31 @@
 # AMS -- Gateway DLP for Claude Code and Cowork
 
-Cloudflare Gateway Forward Worker that enforces DLP on Claude Code and Cowork traffic to `api.anthropic.com`. Built for the American Musical Supply Zero Trust / DLP proof of concept.
+Two approaches to DLP enforcement for Claude Code and OpenCode traffic to `api.anthropic.com`, covering both Cloudflare AI Gateway (native DLP) and a Secure Web Gateway Forward Worker (code-managed DLP). Built for the American Musical Supply Zero Trust / DLP proof of concept.
+
+## Two approaches
+
+| | AI Gateway with DLP | Forward Worker (this repo) |
+|---|---|---|
+| DLP engine | Cloudflare DLP -- dashboard profiles, EDM, wordlists | Regex patterns in `src/index.ts` |
+| Pattern management | Dashboard, shared with the rest of the org | Edit code, redeploy |
+| TLS decryption required | No | Yes |
+| Coverage | Clients configured to point at AI Gateway | Any enrolled device hitting `api.anthropic.com` |
+| Streaming | Buffers full response before scanning (latency impact) | Scans SSE at block boundaries, streams in real time |
+| Logs | AI Gateway logs | Gateway HTTP logs + R2 |
+
+See `DEPLOY.md` Section 1 for the full trade-off analysis and why the Worker was chosen for this POC.
 
 ## Start here
 
 **[DEPLOY.md](DEPLOY.md)** -- architecture, what the Worker does, and the seven deployment phases with validation steps.
 
+For the AI Gateway approach, go directly to **[Section 15 of DEPLOY.md](DEPLOY.md#15-alternative-ai-gateway-with-native-dlp)**.
+
 ## What is in this repository
 
 | Path | Purpose |
 |---|---|
-| `DEPLOY.md` | Deployment guide |
+| `DEPLOY.md` | Deployment guide (Worker path + AI Gateway alternative) |
 | `src/index.ts` | The Forward Worker |
 | `test/extract.test.mjs` | 8 tests covering gzip decompression, user-text extraction, fail-closed paths |
 | `wrangler.jsonc` | Worker configuration (R2 binding for violation logs) |

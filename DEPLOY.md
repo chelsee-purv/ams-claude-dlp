@@ -27,6 +27,7 @@
 12. [Limitations](#12-limitations)
 13. [Troubleshooting](#13-troubleshooting)
 14. [Appendix -- Investigation History](#14-appendix----investigation-history)
+15. [Alternative: AI Gateway with Native DLP](#15-alternative-ai-gateway-with-native-dlp)
 
 ---
 
@@ -471,3 +472,198 @@ For the record, the sequence that led to the Worker-as-control decision:
 5. **Decision:** make the Worker the control. It handles all three remaining candidates by construction (host-scoped Forward policy, schema-aware extraction with no size dependency, parses JSON before scanning). AI Gateway with DLP was identified as the native alternative (Section 1) and deliberately not selected for this POC for the reasons stated there.
 
 If the Gateway-side root cause is still of interest after the POC, three `curl` tests isolate it: plain body to `api.anthropic.com` (host scope), 300 KB body (size), and a body with the SSN inside a `tool_result` block (encoding). Each is a five-minute check against the Gateway HTTP log with the Forward policy temporarily disabled.
+
+---
+
+## 15. Alternative: AI Gateway with Native DLP
+
+This section is a self-contained guide for the AI Gateway path. It does not require the Forward Worker, TLS decryption, or the Gateway HTTP policy from Sections 4--8. Use it if AMS wants to evaluate AI Gateway alongside or instead of the Worker approach.
+
+### 15.1 What is different
+
+| | Forward Worker (Sections 1--14) | AI Gateway with DLP (this section) |
+|---|---|---|
+| DLP engine | Regex in `src/index.ts` | Cloudflare DLP -- same dashboard profiles as the rest of the org |
+| Pattern management | Edit code, redeploy | Dashboard (**Zero Trust > DLP > DLP profiles**), shared with all Gateway policies |
+| TLS decryption | Required | Not required |
+| Coverage | Any enrolled device hitting `api.anthropic.com` | Clients configured to point at AI Gateway |
+| Streaming | Scans SSE at `content_block_stop`, real-time delivery | Buffers full response before scanning; time-to-first-token increases |
+| Logs | Gateway HTTP logs + R2 | AI Gateway logs (separate from Gateway HTTP logs) |
+| Auth model | Developer's own claude.ai / Anthropic account | Org Anthropic API key (BYOK) or Cloudflare Unified Billing credits |
+
+**Key limitation of the AI Gateway path:** coverage depends on the client being configured to use the gateway URL. A developer who removes or overrides `ANTHROPIC_BASE_URL` bypasses DLP entirely. The Forward Worker applies to any enrolled device regardless of client config.
+
+### 15.2 Prerequisites
+
+- [ ] A Cloudflare account with AI Gateway available (all paid plans; Free plan has limited log retention)
+- [ ] Either: an Anthropic API key stored as a provider key (BYOK) in AI Gateway, **or** Cloudflare Unified Billing credits loaded on the account
+- [ ] DLP profiles already configured in **Zero Trust > DLP > DLP profiles** (they are shared -- no new profiles needed if the org already has them)
+- [ ] Claude Code and/or OpenCode installed on test machines
+
+No WARP enrollment, no TLS certificate installation, and no Workers Paid plan are required for this path.
+
+### 15.3 Step 1 -- Create an AI Gateway
+
+1. In the Cloudflare dashboard, go to **AI Gateway > Overview > Create gateway**.
+2. Name it (e.g. `ams-claude-dlp`) and note the **gateway slug** -- you will use it in the URLs below.
+3. Enable **Authenticated gateway** (**Settings > Authentication > Enabled**). This prevents requests without a valid gateway token from reaching Anthropic.
+4. Copy or create a **gateway token** with `Run` permissions (**Settings > Authentication > Create token**). Save it as `CF_AIG_TOKEN`.
+
+### 15.4 Step 2 -- Store the Anthropic API key (BYOK)
+
+If using an org-held Anthropic API key rather than Unified Billing:
+
+1. Go to **AI Gateway > [your gateway] > Settings > Provider keys > Add provider key**.
+2. Select **Anthropic**, paste the API key, set the alias to `default`, and save.
+
+Developers do not need their own Anthropic accounts or API keys when using BYOK or Unified Billing. All usage is billed to the org key.
+
+### 15.5 Step 3 -- Enable DLP on the gateway
+
+1. Go to **AI Gateway > [your gateway] > Settings > Data Loss Prevention**.
+2. Click **Add DLP policy**.
+3. Select the DLP profiles to apply (e.g. the same SSN, credit card, and API key profiles already in use in Gateway HTTP policies).
+4. Set **Action** to **Block** for violations, **Flag** for audit-only.
+5. Set **Check** to **Request and response** (or **Request** only if streaming latency is a concern -- see note below).
+6. Save.
+
+> **Streaming latency note:** When **Check** includes responses, AI Gateway buffers the full provider response before scanning and releasing it to the client. For a typical Claude response this adds 5--15 seconds to time-to-first-token. If that is unacceptable, set **Check** to **Request** only. Request-side is the primary control in the Worker path as well, and catches the most important case (sensitive data leaving the user's machine).
+
+### 15.6 Step 4 -- Configure Claude Code
+
+Claude Code reads its endpoint from the `ANTHROPIC_BASE_URL` environment variable. Set it to your AI Gateway's Anthropic endpoint and authenticate with your gateway token.
+
+Replace `<ACCOUNT_ID>`, `<GATEWAY_ID>`, and `<CF_AIG_TOKEN>` with your values.
+
+**macOS / Linux / WSL:**
+
+```bash
+export ANTHROPIC_BASE_URL="https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic"
+export ANTHROPIC_API_KEY="<CF_AIG_TOKEN>"
+export ANTHROPIC_CUSTOM_HEADERS="cf-aig-authorization: Bearer <CF_AIG_TOKEN>"
+```
+
+**Windows (PowerShell):**
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic"
+$env:ANTHROPIC_API_KEY = "<CF_AIG_TOKEN>"
+$env:ANTHROPIC_CUSTOM_HEADERS = "cf-aig-authorization: Bearer <CF_AIG_TOKEN>"
+```
+
+To persist across sessions, add to `~/.claude/settings.json` under the `env` key:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic",
+    "ANTHROPIC_API_KEY": "<CF_AIG_TOKEN>",
+    "ANTHROPIC_CUSTOM_HEADERS": "cf-aig-authorization: Bearer <CF_AIG_TOKEN>"
+  }
+}
+```
+
+Start Claude Code normally:
+
+```bash
+claude
+```
+
+To lock Claude Code so developers cannot point it at a different endpoint, add `allowedProviders: ["customEndpoint"]` to the managed settings policy (macOS: `com.anthropic.claudefordesktop`, Windows: `HKLM\SOFTWARE\Policies\Claude`).
+
+**WSL note:** The environment variables must be set inside WSL, not on the Windows host. Add them to `~/.bashrc` or `~/.zshrc` inside Ubuntu, or to `~/.claude/settings.json` on the WSL filesystem. WSL mirrored networking (`networkingMode=mirrored` in `.wslconfig`) is not required for the AI Gateway path -- requests go directly to `gateway.ai.cloudflare.com` over the internet, not through the WARP tunnel.
+
+### 15.7 Step 5 -- Configure OpenCode
+
+OpenCode supports custom provider configuration via `opencode.json`. Create or update the file in your project root (or globally at `~/.config/opencode/opencode.json`).
+
+Replace `<ACCOUNT_ID>`, `<GATEWAY_ID>`, and `<CF_AIG_TOKEN>` with your values. The token can also be set as an environment variable and referenced with `{env:CF_AIG_TOKEN}`.
+
+```bash
+export CF_AIG_TOKEN="<CF_AIG_TOKEN>"
+```
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "anthropic": {
+      "name": "Anthropic via Cloudflare AI Gateway",
+      "options": {
+        "baseURL": "https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic/v1",
+        "apiKey": "",
+        "headers": {
+          "cf-aig-authorization": "Bearer {env:CF_AIG_TOKEN}"
+        }
+      }
+    }
+  }
+}
+```
+
+Leave `apiKey` empty -- AI Gateway supplies credentials from your stored provider key (BYOK) or Unified Billing. Start OpenCode normally:
+
+```bash
+opencode
+```
+
+> **OpenCode with Cloudflare Access:** If you protect the AI Gateway with Cloudflare Access (recommended for production), OpenCode can authenticate with a short-lived Access token via `cloudflared`. See the [OpenCode + Access docs](https://developers.cloudflare.com/ai-gateway/integrations/coding-agents/opencode/#use-with-cloudflare-access) for the full setup including centrally-hosted config distribution.
+
+### 15.8 Step 6 -- Validate
+
+**Confirm traffic is reaching AI Gateway:**
+
+```bash
+curl -s https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic/v1/messages \
+  -H "x-api-key: <CF_AIG_TOKEN>" \
+  -H "cf-aig-authorization: Bearer <CF_AIG_TOKEN>" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":20,"messages":[{"role":"user","content":"Say hello"}]}'
+```
+
+Expected: a valid Claude response. Check **AI Gateway > [your gateway] > Logs** -- the request should appear with provider `anthropic`, status `200`, and no DLP findings.
+
+**Trigger a DLP block:**
+
+```bash
+curl -s https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/anthropic/v1/messages \
+  -H "x-api-key: <CF_AIG_TOKEN>" \
+  -H "cf-aig-authorization: Bearer <CF_AIG_TOKEN>" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":20,"messages":[{"role":"user","content":"My SSN is 078-05-1120"}]}'
+```
+
+Expected: `HTTP 400`, body contains a DLP error. AI Gateway logs show the request with a DLP **Block** action and the matched profile name. The `cf-aig-dlp` response header is present on flagged (non-blocked) requests.
+
+**Confirm from Claude Code:**
+
+Send `My SSN is 078-05-1120` as a prompt in Claude Code. Expected: Claude Code displays an API error. AI Gateway logs show the block.
+
+**Confirm from OpenCode:**
+
+Same prompt from OpenCode. Same expected outcome.
+
+### 15.9 Logs and audit
+
+AI Gateway logs are separate from Gateway HTTP logs. To view them:
+
+**Dashboard:** **AI Gateway > [your gateway] > Logs** -- shows each request with model, tokens, cost, latency, cache status, and DLP action.
+
+**Logpush:** For SIEM integration, configure a Logpush job to export AI Gateway logs to your destination (S3, Splunk, Datadog, etc.): **AI Gateway > [your gateway] > Settings > Logpush > Add Logpush job**.
+
+**GraphQL Analytics:** AI Gateway exposes token usage, cost, and DLP event counts via the Cloudflare GraphQL Analytics API. Use dataset `aiGatewayAdaptiveGroups`.
+
+DLP block events appear in logs with `dlpAction: "block"` and include the matched profile name. The matched text itself is not logged (consistent with Cloudflare DLP behavior in Gateway HTTP policies).
+
+### 15.10 Trade-offs vs. the Forward Worker
+
+If after evaluating both approaches AMS wants to move from the Worker to AI Gateway full-time:
+
+1. Remove the Forward Worker Gateway policy (Section 8) so traffic flows directly to `api.anthropic.com` through Gateway, then to AI Gateway via the client's `ANTHROPIC_BASE_URL`.
+2. Keep the native Gateway DLP policy in place for Claude web and Desktop chat -- those are unaffected.
+3. Distribute the `ANTHROPIC_BASE_URL` and `CF_AIG_TOKEN` settings to all developer machines via MDM or managed settings.
+4. The Worker and R2 bucket can be left in place but will no longer receive traffic -- decommission them when ready.
+
+The Worker can be retired without changing any other Zero Trust configuration.
